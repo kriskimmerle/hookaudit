@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""hookaudit - Git Hook & Repository Config Security Auditor.
+"""hookaudit — Git Hook Security Auditor.
 
-Scans git hooks, .gitattributes, .gitconfig, Husky configs, and other
-hook frameworks for malicious or dangerous patterns. Detects reverse shells,
-credential theft, data exfiltration, obfuscated payloads, and more.
+Scans git hook configurations for supply chain attack patterns.
+Audits .pre-commit-config.yaml, .git/hooks/, husky, lint-staged,
+and lefthook configs for malicious code, untrusted sources,
+unpinned versions, and dangerous commands.
 
-Zero dependencies. Stdlib only. Python 3.8+.
+Zero dependencies. Python 3.9+.
+
+Usage:
+    hookaudit [PATH]              Scan project (default: current dir)
+    hookaudit --json              JSON output
+    hookaudit --check [GRADE]     CI mode (exit 1 if below grade)
+    hookaudit --verbose           Show fix suggestions
+    hookaudit --list-rules        List all rules
+    hookaudit --severity LEVEL    Minimum severity to report
+    hookaudit --ignore R1,R2      Skip specific rules
 """
 
 from __future__ import annotations
@@ -17,1098 +27,1440 @@ import re
 import stat
 import sys
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
+
 
 __version__ = "0.1.0"
 
-# ── Severity ────────────────────────────────────────────────────────
+# ── Severity ──────────────────────────────────────────────────────────────────
 
-class Severity(Enum):
+class Severity:
     CRITICAL = "CRITICAL"
     HIGH = "HIGH"
     MEDIUM = "MEDIUM"
     LOW = "LOW"
     INFO = "INFO"
 
-    @property
-    def score(self) -> int:
-        return {
-            "CRITICAL": 25,
-            "HIGH": 15,
-            "MEDIUM": 8,
-            "LOW": 3,
-            "INFO": 0,
-        }[self.value]
+    _order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+
+    @classmethod
+    def weight(cls, s: str) -> int:
+        return cls._order.get(s, 0)
 
 
-# ── Finding ─────────────────────────────────────────────────────────
+# ── Finding ───────────────────────────────────────────────────────────────────
 
 @dataclass
 class Finding:
     rule_id: str
-    severity: Severity
+    severity: str
     message: str
     file: str
-    line: int = 0
-    evidence: str = ""
+    line: Optional[int] = None
+    context: Optional[str] = None
+    fix: Optional[str] = None
 
     def to_dict(self) -> dict:
-        d: dict = {
+        d = {
             "rule_id": self.rule_id,
-            "severity": self.severity.value,
+            "severity": self.severity,
             "message": self.message,
             "file": self.file,
         }
-        if self.line:
+        if self.line is not None:
             d["line"] = self.line
-        if self.evidence:
-            d["evidence"] = self.evidence
+        if self.context:
+            d["context"] = self.context
+        if self.fix:
+            d["fix"] = self.fix
         return d
 
 
-# ── Rules ───────────────────────────────────────────────────────────
+# ── Rules ─────────────────────────────────────────────────────────────────────
 
-# HA001: Reverse shell patterns
+RULES: dict[str, dict] = {
+    "HK001": {
+        "name": "shell-injection",
+        "severity": Severity.CRITICAL,
+        "description": "Shell injection pattern in hook (curl|bash, eval, exec)",
+    },
+    "HK002": {
+        "name": "reverse-shell",
+        "severity": Severity.CRITICAL,
+        "description": "Reverse shell or backdoor pattern detected",
+    },
+    "HK003": {
+        "name": "data-exfiltration",
+        "severity": Severity.CRITICAL,
+        "description": "Data exfiltration pattern (POST with sensitive data)",
+    },
+    "HK004": {
+        "name": "credential-access",
+        "severity": Severity.CRITICAL,
+        "description": "Hook accesses credential files (.ssh, .aws, .gnupg, keychain)",
+    },
+    "HK005": {
+        "name": "unpinned-rev",
+        "severity": Severity.HIGH,
+        "description": "Hook repo uses tag/branch instead of pinned SHA commit",
+    },
+    "HK006": {
+        "name": "untrusted-repo",
+        "severity": Severity.HIGH,
+        "description": "Hook from unverified/unknown repository source",
+    },
+    "HK007": {
+        "name": "local-hook-danger",
+        "severity": Severity.HIGH,
+        "description": "Local hook definition contains dangerous commands",
+    },
+    "HK008": {
+        "name": "hidden-payload",
+        "severity": Severity.HIGH,
+        "description": "Base64 decoding, obfuscated code, or hidden payload",
+    },
+    "HK009": {
+        "name": "missing-rev",
+        "severity": Severity.MEDIUM,
+        "description": "Hook repo has no pinned version (uses latest)",
+    },
+    "HK010": {
+        "name": "filesystem-escape",
+        "severity": Severity.MEDIUM,
+        "description": "Hook accesses files outside repository boundary",
+    },
+    "HK011": {
+        "name": "sudo-usage",
+        "severity": Severity.MEDIUM,
+        "description": "Hook uses sudo or privilege escalation",
+    },
+    "HK012": {
+        "name": "network-access",
+        "severity": Severity.MEDIUM,
+        "description": "Hook makes network requests (curl, wget, fetch)",
+    },
+    "HK013": {
+        "name": "file-modification",
+        "severity": Severity.MEDIUM,
+        "description": "Hook modifies or deletes files in unexpected ways",
+    },
+    "HK014": {
+        "name": "env-manipulation",
+        "severity": Severity.MEDIUM,
+        "description": "Hook manipulates environment variables or PATH",
+    },
+    "HK015": {
+        "name": "hook-bypass",
+        "severity": Severity.LOW,
+        "description": "Hook can be bypassed (--no-verify, SKIP mentioned)",
+    },
+    "HK016": {
+        "name": "excessive-hooks",
+        "severity": Severity.LOW,
+        "description": "Large number of hooks increases attack surface",
+    },
+    "HK017": {
+        "name": "embedded-secret",
+        "severity": Severity.HIGH,
+        "description": "Hardcoded secret or API key in hook configuration",
+    },
+    "HK018": {
+        "name": "dangerous-language",
+        "severity": Severity.MEDIUM,
+        "description": "Hook uses language with high exploitation risk for hooks",
+    },
+    "HK019": {
+        "name": "git-hook-script",
+        "severity": Severity.INFO,
+        "description": "Custom git hook script found in .git/hooks/",
+    },
+    "HK020": {
+        "name": "writable-hooks-dir",
+        "severity": Severity.MEDIUM,
+        "description": "Hooks directory is world-writable",
+    },
+}
+
+
+# ── Trusted Sources ───────────────────────────────────────────────────────────
+
+TRUSTED_ORGS = {
+    "pre-commit",
+    "pre-commit-hooks",
+    "mirrors-",
+    "psf",
+    "python",
+    "astral-sh",
+    "PyCQA",
+    "google",
+    "jumanjihouse",
+    "Lucas-C",
+    "commitizen-tools",
+    "compilerla",
+    "adrienverge",
+    "sqlfluff",
+    "koalaman",
+    "rhysd",
+    "igorshubovych",
+    "alessandrojcm",
+    "gitleaks",
+    "trufflesecurity",
+    "zricethezav",
+    "thoughtworks",
+    "awslabs",
+    "antonbabenko",
+    "gruntwork-io",
+    "bridgecrewio",
+    "cisagov",
+    "DavidAnson",
+    "markdownlint",
+    "hadolint",
+    "shellcheck-py",
+}
+
+TRUSTED_DOMAINS = {
+    "github.com",
+    "gitlab.com",
+}
+
+# SHA pattern: 40 hex chars
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# ── Dangerous Patterns ────────────────────────────────────────────────────────
+
+SHELL_INJECTION_PATTERNS = [
+    (r"curl\s+.*\|\s*(ba)?sh", "curl piped to shell"),
+    (r"wget\s+.*\|\s*(ba)?sh", "wget piped to shell"),
+    (r"curl\s+.*\|\s*python", "curl piped to python"),
+    (r"\beval\s*\(", "eval() call"),
+    (r"\beval\s+[\"'\$]", "shell eval"),
+    (r"\bexec\s*\(", "exec() call"),
+    (r"\bexec\s+[\"'\$]", "shell exec"),
+    (r"python\s+-c\s+['\"].*(?:import|exec|eval)", "python -c with code execution"),
+    (r"node\s+-e\s+['\"].*(?:require|child_process|exec)", "node -e with code execution"),
+    (r"ruby\s+-e\s+['\"].*(?:system|exec|`)", "ruby -e with code execution"),
+    (r"perl\s+-e\s+['\"].*(?:system|exec|`)", "perl -e with code execution"),
+    (r"\bsource\s+/dev/tcp/", "bash /dev/tcp source (network)"),
+    (r">\s*/dev/tcp/", "bash /dev/tcp redirect"),
+]
+
 REVERSE_SHELL_PATTERNS = [
-    # Bash reverse shells
-    re.compile(r'bash\s+-i\s+>&\s*/dev/tcp/', re.I),
-    re.compile(r'bash\s+-i\s+>&\s*/dev/udp/', re.I),
-    re.compile(r'/dev/tcp/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d+', re.I),
-    # Netcat reverse shells
-    re.compile(r'\bnc\b.*\s-e\s', re.I),
-    re.compile(r'\bncat\b.*\s-e\s', re.I),
-    re.compile(r'\bnetcat\b.*\s-e\s', re.I),
-    re.compile(r'\bnc\b.*\s-c\s', re.I),
-    # Python reverse shells
-    re.compile(r'python[23]?\s+-c\s+["\'].*socket.*connect', re.I | re.S),
-    re.compile(r'import\s+socket.*subprocess.*PIPE', re.I | re.S),
-    # Perl reverse shells
-    re.compile(r'perl\s+-e\s+["\'].*socket.*exec', re.I | re.S),
-    # Ruby reverse shells
-    re.compile(r'ruby\s+-rsocket\s+-e', re.I),
-    # PHP reverse shells
-    re.compile(r'php\s+-r\s+["\'].*fsockopen', re.I),
-    # Socat
-    re.compile(r'socat\b.*exec.*tcp', re.I),
-    # Telnet piped
-    re.compile(r'telnet\b.*\|\s*/bin/(ba)?sh', re.I),
-    # mkfifo pipe reverse
-    re.compile(r'mkfifo\b.*\bnc\b', re.I),
+    (r"/dev/tcp/\d", "bash reverse shell via /dev/tcp"),
+    (r"nc\s+(-e|-c)\s+", "netcat reverse shell"),
+    (r"ncat\s+(-e|-c)\s+", "ncat reverse shell"),
+    (r"mkfifo\s+.*\bsh\b", "named pipe shell redirect"),
+    (r"socket\s*\.\s*socket.*connect", "Python socket connect"),
+    (r"subprocess.*shell\s*=\s*True", "subprocess with shell=True"),
+    (r"os\.system\s*\(", "os.system call"),
+    (r"child_process.*exec", "Node child_process exec"),
+    (r"socat\s+.*exec:", "socat exec"),
+    (r"\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}", "hex-encoded shellcode"),
 ]
 
-# HA002: Credential theft patterns
-CREDENTIAL_THEFT_PATTERNS = [
-    # SSH keys
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*~/\.ssh/', re.I), "SSH key access"),
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*/\.ssh/', re.I), "SSH key access"),
-    # Git credentials
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*\.git-credentials', re.I), "git credential access"),
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*\.gitconfig', re.I), "global gitconfig access"),
-    # AWS credentials
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*~/\.aws/', re.I), "AWS credential access"),
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*/\.aws/', re.I), "AWS credential access"),
-    # GCP credentials
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*application_default_credentials', re.I), "GCP credential access"),
-    # GPG keys
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*~/\.gnupg/', re.I), "GPG key access"),
-    # Browser data
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*/Chrome/.*Login\s*Data', re.I), "browser credential access"),
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*/Firefox/.*logins\.json', re.I), "browser credential access"),
-    # Keychains
-    (re.compile(r'security\s+find-(generic|internet)-password', re.I), "macOS Keychain access"),
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*\.kube/config', re.I), "Kubernetes config access"),
-    # npmrc / pypirc / docker
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*\.(npmrc|pypirc|docker/config\.json)', re.I), "package registry credential access"),
-    # Generic password files
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*/(passwd|shadow)\b', re.I), "password file access"),
-    # Env file exfil
-    (re.compile(r'(cat|cp|tar|zip|curl|wget|scp)\b.*\.env\b', re.I), "env file access"),
+EXFILTRATION_PATTERNS = [
+    (r"curl\s+.*(-d|--data)\s+.*(\$|`|\.env|\.ssh|\.aws|password|secret|token|key)", "curl POST with sensitive data"),
+    (r"curl\s+.*(-X\s+POST|-X\s+PUT)\s+.*(\$|`)", "curl POST/PUT with variables"),
+    (r"wget\s+.*--post-(data|file)", "wget POST data"),
+    (r"cat\s+.*\|\s*curl", "file contents piped to curl"),
+    (r"tar\s+.*\|\s*(curl|nc|ncat)", "archive piped to network tool"),
+    (r"zip\s+.*\|\s*(curl|nc|ncat)", "compressed data to network"),
+    (r"base64\s+.*\|\s*curl", "encoded data to curl"),
+    (r"(\$HOME|~/)\.(ssh|aws|gnupg|config).*curl", "credential file to curl"),
 ]
 
-# HA003: Data exfiltration
-EXFIL_PATTERNS = [
-    # curl/wget POST with data
-    (re.compile(r'curl\b.*(-d|--data|--data-binary|--data-raw)\b', re.I), "HTTP POST data exfiltration"),
-    (re.compile(r'curl\b.*-X\s*POST', re.I), "HTTP POST exfiltration"),
-    (re.compile(r'wget\b.*--post-(data|file)', re.I), "HTTP POST data exfiltration"),
-    # DNS exfiltration
-    (re.compile(r'(dig|nslookup|host)\b.*\$\(', re.I), "DNS data exfiltration"),
-    (re.compile(r'\$\(.*\)\.(.*\.)+\w{2,}', re.I), "DNS data exfiltration"),
-    # Netcat data send
-    (re.compile(r'\|\s*(nc|ncat|netcat)\b', re.I), "pipe to netcat"),
-    # scp/rsync to remote
-    (re.compile(r'scp\b.*[^@\s]+@[^:\s]+:', re.I), "SCP to remote host"),
-    (re.compile(r'rsync\b.*[^@\s]+@[^:\s]+:', re.I), "rsync to remote host"),
+CREDENTIAL_ACCESS_PATTERNS = [
+    (r"(cat|head|tail|less|more|grep)\s+.*\.(ssh|aws|gnupg)/", "reading credential directory"),
+    (r"(cat|head|tail)\s+.*/\.env\b", "reading .env file"),
+    (r"(cat|head|tail)\s+.*/(credentials|token|secret|password|\.netrc)", "reading credentials file"),
+    (r"\$HOME/\.(ssh|aws|gnupg|config/gcloud|azure|kube)", "accessing credential path"),
+    (r"~/\.(ssh|aws|gnupg|config/gcloud|azure|kube)", "accessing credential path"),
+    (r"security\s+find-(generic|internet)-password", "macOS keychain access"),
+    (r"security\s+export\s", "macOS keychain export"),
+    (r"/etc/(shadow|passwd|sudoers)", "system credential file access"),
+    (r"git\s+config\s+.*credential", "git credential access"),
+    (r"gh\s+auth\s+token", "GitHub CLI token access"),
+    (r"npm\s+token", "npm token access"),
 ]
 
-# HA004: Download and execute
-DOWNLOAD_EXEC_PATTERNS = [
-    re.compile(r'curl\b.*\|\s*(ba)?sh\b', re.I),
-    re.compile(r'wget\b.*\|\s*(ba)?sh\b', re.I),
-    re.compile(r'curl\b.*-o\s+\S+.*&&.*chmod\s+\+x', re.I),
-    re.compile(r'wget\b.*-O\s+\S+.*&&.*chmod\s+\+x', re.I),
-    re.compile(r'curl\b.*\|\s*python', re.I),
-    re.compile(r'wget\b.*\|\s*python', re.I),
-    re.compile(r'curl\b.*\|\s*perl', re.I),
-    re.compile(r'curl\b.*\|\s*ruby', re.I),
-    # Downloading and sourcing
-    re.compile(r'curl\b.*>\s*\S+\s*&&?\s*(\.|source)\s', re.I),
+HIDDEN_PAYLOAD_PATTERNS = [
+    (r"base64\s+(-d|--decode)", "base64 decode execution"),
+    (r"echo\s+.*\|\s*base64\s+-d", "echo to base64 decode"),
+    (r"(\\x[0-9a-f]{2}){4,}", "hex-encoded payload"),
+    (r"(\\u[0-9a-f]{4}){4,}", "unicode-encoded payload"),
+    (r"printf\s+.*\\x[0-9a-f]", "printf hex payload"),
+    (r"xxd\s+-r", "xxd reverse hex dump"),
+    (r"\$\(\s*echo\s+.*\|\s*rev\s*\)", "reversed string execution"),
+    (r"String\.fromCharCode\s*\(", "JS string from char codes"),
 ]
 
-# HA005: Obfuscated code
-OBFUSCATION_PATTERNS = [
-    # Base64 decode and execute
-    (re.compile(r'base64\s+(-d|--decode)\b.*\|\s*(ba)?sh', re.I), "base64 decode to shell"),
-    (re.compile(r'base64\s+(-d|--decode)\b.*\|\s*(python|perl|ruby)', re.I), "base64 decode to interpreter"),
-    (re.compile(r'echo\s+\S+\s*\|\s*base64\s+(-d|--decode)', re.I), "base64 payload decoding"),
-    # Hex decode
-    (re.compile(r'xxd\s+-r\b.*\|\s*(ba)?sh', re.I), "hex decode to shell"),
-    (re.compile(r'printf\s+["\']\\x', re.I), "hex-encoded payload"),
-    # eval with variable expansion
-    (re.compile(r'\beval\s+"\$', re.I), "eval of variable (possible obfuscation)"),
-    (re.compile(r'\beval\s+\$\(', re.I), "eval of command substitution"),
-    # Python/Perl exec with decode
-    (re.compile(r'exec\s*\(\s*(base64|codecs)\b', re.I), "exec with decode"),
-    (re.compile(r'__import__\s*\(\s*["\']base64', re.I), "dynamic base64 import"),
-    # Deliberate IFS manipulation
-    (re.compile(r'IFS\s*=\s*[^$\s]', re.I), "IFS manipulation (obfuscation technique)"),
+SECRET_PATTERNS = [
+    (r"ghp_[a-zA-Z0-9]{36}", "GitHub personal access token"),
+    (r"gho_[a-zA-Z0-9]{36}", "GitHub OAuth token"),
+    (r"github_pat_[a-zA-Z0-9_]{22,}", "GitHub PAT (fine-grained)"),
+    (r"sk-[a-zA-Z0-9]{48}", "OpenAI API key"),
+    (r"sk-proj-[a-zA-Z0-9_-]+", "OpenAI project key"),
+    (r"sk-ant-[a-zA-Z0-9_-]+", "Anthropic API key"),
+    (r"AKIA[0-9A-Z]{16}", "AWS access key"),
+    (r"xoxb-[0-9]+-[a-zA-Z0-9]+", "Slack bot token"),
+    (r"xoxp-[0-9]+-[a-zA-Z0-9]+", "Slack user token"),
+    (r"SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}", "SendGrid API key"),
+    (r"sk_live_[a-zA-Z0-9]{24,}", "Stripe secret key"),
+    (r"rk_live_[a-zA-Z0-9]{24,}", "Stripe restricted key"),
+    (r"-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\sKEY-----", "Private key"),
+    (r"eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.", "JWT token"),
 ]
 
-# HA006: Dangerous shell commands
-DANGEROUS_CMD_PATTERNS = [
-    (re.compile(r'\brm\s+(-rf|--recursive)\s+(/|~/|\$HOME|\${HOME})\s*$', re.M), "recursive delete of home/root"),
-    (re.compile(r'\brm\s+(-rf|--recursive)\s+/\S*\s*$', re.M), "recursive delete of system path"),
-    (re.compile(r'\bdd\b.*of=/dev/', re.I), "disk overwrite"),
-    (re.compile(r'\bmkfs\b', re.I), "filesystem format"),
-    (re.compile(r':\(\)\s*\{\s*:\|:&\s*\};\s*:', re.I), "fork bomb"),
-    (re.compile(r'>\s*/dev/sd[a-z]', re.I), "direct disk write"),
+FILESYSTEM_ESCAPE_PATTERNS = [
+    (r"\.\./\.\.", "directory traversal (../..)"),
+    (r"(?:^|\s)/(?:etc|var|tmp|usr|opt|root|home)\b", "absolute system path access"),
+    (r"\$HOME(?!/\.|/\.local)", "HOME directory access"),
+    (r"~/(?!\.|\.local)", "home directory access"),
+    (r"(?:^|\s)/\s", "root directory reference"),
 ]
 
-# HA007: Privilege escalation
-PRIV_ESC_PATTERNS = [
-    (re.compile(r'\bsudo\b', re.I), "sudo usage in hook"),
-    (re.compile(r'\bsu\s+-\b', re.I), "su usage in hook"),
-    (re.compile(r'chmod\s+[0-7]*4[0-7]{2}\b', re.I), "setuid bit"),
-    (re.compile(r'chmod\s+[0-7]*2[0-7]{2}\b', re.I), "setgid bit"),
-    (re.compile(r'chmod\s+u\+s\b', re.I), "setuid bit"),
-    (re.compile(r'chown\s+root\b', re.I), "changing ownership to root"),
+SUDO_PATTERNS = [
+    (r"\bsudo\s+", "sudo usage"),
+    (r"\bsu\s+-", "su switch user"),
+    (r"\bdoas\s+", "doas usage"),
+    (r"chmod\s+[0-7]*7[0-7]*\s+", "chmod world-writable"),
+    (r"chmod\s+u\+s\s+", "setuid bit"),
+    (r"chown\s+root", "chown to root"),
 ]
 
-# HA008: Environment variable exfiltration
-ENV_EXFIL_PATTERNS = [
-    (re.compile(r'\benv\b.*\|\s*(curl|wget|nc|ncat)', re.I), "env piped to network"),
-    (re.compile(r'\bprintenv\b.*\|\s*(curl|wget|nc|ncat)', re.I), "env piped to network"),
-    (re.compile(r'echo\s+\$\w+.*\|\s*(curl|wget|nc|ncat)', re.I), "env var piped to network"),
-    (re.compile(r'(curl|wget)\b.*\$\w*(TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL|AUTH)', re.I), "secret env var sent to network"),
-    (re.compile(r'set\b.*\|\s*(curl|wget|nc|ncat)', re.I), "shell vars piped to network"),
+NETWORK_PATTERNS = [
+    (r"\bcurl\s+", "curl request"),
+    (r"\bwget\s+", "wget request"),
+    (r"\bfetch\s*\(", "fetch() call"),
+    (r"http\.request", "HTTP request"),
+    (r"requests\.(get|post|put|patch|delete)", "Python requests call"),
+    (r"urllib\.request", "Python urllib request"),
+    (r"http\.client", "Python http.client"),
+    (r"\bnc\s+", "netcat"),
+    (r"\bnmap\s+", "nmap scan"),
+    (r"socket\.\w+\(", "socket connection"),
 ]
 
-# HA009: Background process spawning
-BACKGROUND_PATTERNS = [
-    (re.compile(r'\bnohup\b.*&', re.I), "nohup background process"),
-    (re.compile(r'\bdisown\b', re.I), "disowned process"),
-    (re.compile(r'\bsetsid\b', re.I), "new session process"),
-    (re.compile(r'\bscreen\s+-dm\b', re.I), "detached screen session"),
-    (re.compile(r'\btmux\b.*new-session\s+-d', re.I), "detached tmux session"),
-    (re.compile(r'\bat\s+(now|midnight|\d)', re.I), "scheduled task creation"),
-    (re.compile(r'crontab\b', re.I), "crontab modification"),
+FILE_MOD_PATTERNS = [
+    (r"rm\s+-rf?\s+/", "recursive delete from root"),
+    (r"rm\s+-rf?\s+\*", "recursive delete wildcard"),
+    (r"rm\s+-rf?\s+\$", "recursive delete variable"),
+    (r">\s*/dev/null\s*2>&1\s*&", "silenced background process"),
+    (r"mktemp.*&&.*rm", "temp file race condition"),
+    (r"truncate\s+-s\s*0", "file truncation"),
 ]
 
-# HA010: Filesystem modification outside repo
-FS_MOD_PATTERNS = [
-    (re.compile(r'>\s*~/\.(bashrc|zshrc|profile|bash_profile|bash_login)', re.I), "shell profile modification"),
-    (re.compile(r'>>\s*~/\.(bashrc|zshrc|profile|bash_profile|bash_login)', re.I), "shell profile append"),
-    (re.compile(r'(cp|mv|tee|cat\s*>)\b.*/etc/', re.I), "system config modification"),
-    (re.compile(r'(cp|mv|tee|cat\s*>)\b.*/usr/', re.I), "system binary modification"),
-    (re.compile(r'mkdir\s+-p\s*~/\.local/bin.*&&.*cp\b', re.I), "binary installation to PATH"),
-    (re.compile(r'(cp|install)\b.*\s+/usr/local/bin/', re.I), "binary installation to system PATH"),
+ENV_MANIPULATION_PATTERNS = [
+    (r"export\s+PATH=", "PATH modification"),
+    (r"export\s+LD_PRELOAD=", "LD_PRELOAD injection"),
+    (r"export\s+LD_LIBRARY_PATH=", "LD_LIBRARY_PATH modification"),
+    (r"export\s+PYTHONPATH=", "PYTHONPATH modification"),
+    (r"export\s+NODE_PATH=", "NODE_PATH modification"),
+    (r"export\s+GIT_.*=", "GIT environment modification"),
+    (r"unset\s+(PATH|HOME|USER|SHELL)", "critical env var unset"),
 ]
 
-# HA011: Crypto mining indicators
-CRYPTO_MINING_PATTERNS = [
-    (re.compile(r'(xmrig|minerd|cpuminer|cgminer|bfgminer|ethminer|nbminer)', re.I), "crypto miner binary"),
-    (re.compile(r'stratum\+tcp://', re.I), "stratum mining pool"),
-    (re.compile(r'(pool\.|mining\.|mine\.).*:\d{4,5}', re.I), "mining pool connection"),
-    (re.compile(r'--algo\s+(cryptonight|randomx|ethash|kawpow)', re.I), "mining algorithm flag"),
-    (re.compile(r'--donate-level', re.I), "mining donation setting"),
-]
 
-# ── Git Hook Names ──────────────────────────────────────────────────
+# ── YAML Parser (minimal, for pre-commit config) ─────────────────────────────
 
-KNOWN_HOOKS = {
-    "applypatch-msg", "pre-applypatch", "post-applypatch",
-    "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit",
-    "pre-rebase", "post-checkout", "post-merge", "pre-push",
-    "pre-receive", "update", "post-receive", "post-update",
-    "push-to-checkout", "pre-auto-gc", "post-rewrite",
-    "sendemail-validate", "fsmonitor-watchman",
-    "p4-changelist", "p4-prepare-changelist",
-    "p4-post-changelist", "p4-pre-submit",
-    "post-index-change", "reference-transaction",
-}
-
-# High-risk hooks (auto-triggered on common operations)
-HIGH_RISK_HOOKS = {
-    "post-checkout",   # Triggers on clone, checkout, switch
-    "post-merge",      # Triggers on pull
-    "pre-commit",      # Triggers on every commit
-    "pre-push",        # Triggers on push
-    "prepare-commit-msg",  # Triggers on every commit
-    "post-rewrite",    # Triggers on rebase, amend
-}
-
-# ── Scanner ─────────────────────────────────────────────────────────
-
-@dataclass
-class ScanResult:
-    findings: List[Finding] = field(default_factory=list)
-    files_scanned: int = 0
-    hooks_found: int = 0
-
-    @property
-    def risk_score(self) -> int:
-        score = sum(f.severity.score for f in self.findings)
-        return min(score, 100)
-
-    @property
-    def grade(self) -> str:
-        s = self.risk_score
-        if s == 0:
-            return "A+"
-        elif s <= 10:
-            return "A"
-        elif s <= 20:
-            return "B"
-        elif s <= 35:
-            return "C"
-        elif s <= 50:
-            return "D"
-        else:
-            return "F"
-
-    @property
-    def risk_label(self) -> str:
-        s = self.risk_score
-        if s == 0:
-            return "SAFE"
-        elif s <= 20:
-            return "LOW"
-        elif s <= 50:
-            return "MODERATE"
-        elif s <= 75:
-            return "HIGH"
-        else:
-            return "CRITICAL"
-
-
-def _truncate(text: str, maxlen: int = 120) -> str:
-    text = text.strip()
-    if len(text) > maxlen:
-        return text[:maxlen - 3] + "..."
-    return text
-
-
-def _scan_content(content: str, filepath: str, result: ScanResult) -> None:
-    """Run all pattern-based rules against file content."""
-    lines = content.split("\n")
-
-    for line_num, line in enumerate(lines, 1):
+def parse_yaml_simple(text: str) -> list[dict]:
+    """Parse a .pre-commit-config.yaml file into a list of repo entries.
+    
+    This is a purpose-built parser for pre-commit config files, not a general
+    YAML parser. It handles the specific structure: repos list with repo/rev/hooks.
+    """
+    repos = []
+    current_repo: dict | None = None
+    current_hook: dict | None = None
+    in_repos = False
+    in_hooks = False
+    in_additional_deps = False
+    in_args = False
+    
+    lines = text.split("\n")
+    
+    for i, line in enumerate(lines, 1):
         stripped = line.strip()
-        # Skip empty lines and comments
+        
+        # Skip comments and empty lines
         if not stripped or stripped.startswith("#"):
             continue
-
-        # HA001: Reverse shells
-        for pattern in REVERSE_SHELL_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA001",
-                    severity=Severity.CRITICAL,
-                    message="Reverse shell pattern detected",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break  # One finding per line per rule
-
-        # HA002: Credential theft
-        for pattern, desc in CREDENTIAL_THEFT_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA002",
-                    severity=Severity.CRITICAL,
-                    message=f"Credential theft: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA003: Data exfiltration
-        for pattern, desc in EXFIL_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA003",
-                    severity=Severity.HIGH,
-                    message=f"Data exfiltration: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA004: Download and execute
-        for pattern in DOWNLOAD_EXEC_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA004",
-                    severity=Severity.CRITICAL,
-                    message="Download and execute pattern",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA005: Obfuscated code
-        for pattern, desc in OBFUSCATION_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA005",
-                    severity=Severity.HIGH,
-                    message=f"Obfuscated code: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA006: Dangerous commands
-        for pattern, desc in DANGEROUS_CMD_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA006",
-                    severity=Severity.CRITICAL,
-                    message=f"Dangerous command: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA007: Privilege escalation
-        for pattern, desc in PRIV_ESC_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA007",
-                    severity=Severity.HIGH,
-                    message=f"Privilege escalation: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA008: Environment variable exfiltration
-        for pattern, desc in ENV_EXFIL_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA008",
-                    severity=Severity.CRITICAL,
-                    message=f"Environment exfiltration: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA009: Background processes
-        for pattern, desc in BACKGROUND_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA009",
-                    severity=Severity.MEDIUM,
-                    message=f"Background process: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA010: Filesystem modification
-        for pattern, desc in FS_MOD_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA010",
-                    severity=Severity.HIGH,
-                    message=f"Filesystem modification: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-        # HA011: Crypto mining
-        for pattern, desc in CRYPTO_MINING_PATTERNS:
-            if pattern.search(stripped):
-                result.findings.append(Finding(
-                    rule_id="HA011",
-                    severity=Severity.CRITICAL,
-                    message=f"Crypto mining: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(stripped),
-                ))
-                break
-
-    # Multi-line patterns (need full content)
-    # HA001 multi-line: reverse shell spanning lines
-    for pattern in REVERSE_SHELL_PATTERNS:
-        if pattern.search(content):
-            # Check if we already caught it line by line
-            if not any(f.rule_id == "HA001" and f.file == filepath for f in result.findings):
-                result.findings.append(Finding(
-                    rule_id="HA001",
-                    severity=Severity.CRITICAL,
-                    message="Reverse shell pattern detected (multi-line)",
-                    file=filepath,
-                    evidence=_truncate(pattern.pattern),
-                ))
+        
+        # Detect repos: section
+        if stripped == "repos:" or stripped.startswith("repos:"):
+            in_repos = True
+            continue
+        
+        if not in_repos:
+            continue
+        
+        # Detect new repo entry
+        if stripped.startswith("- repo:"):
+            if current_hook and current_repo:
+                current_repo.setdefault("hooks", []).append(current_hook)
+            if current_repo:
+                repos.append(current_repo)
+            repo_url = stripped[len("- repo:"):].strip().strip("'\"")
+            current_repo = {"repo": repo_url, "hooks": [], "_line": i}
+            current_hook = None
+            in_hooks = False
+            in_additional_deps = False
+            in_args = False
+            continue
+        
+        if current_repo is None:
+            continue
+        
+        # Detect rev:
+        if stripped.startswith("rev:") and not in_hooks:
+            rev = stripped[len("rev:"):].strip().strip("'\"")
+            current_repo["rev"] = rev
+            continue
+        
+        # Detect hooks: section
+        if stripped == "hooks:" or stripped.startswith("hooks:"):
+            in_hooks = True
+            in_additional_deps = False
+            in_args = False
+            continue
+        
+        if in_hooks:
+            # New hook entry
+            if stripped.startswith("- id:"):
+                if current_hook:
+                    current_repo["hooks"].append(current_hook)
+                hook_id = stripped[len("- id:"):].strip().strip("'\"")
+                current_hook = {"id": hook_id, "_line": i}
+                in_additional_deps = False
+                in_args = False
+                continue
+            
+            if current_hook:
+                # Hook properties
+                if stripped.startswith("name:"):
+                    current_hook["name"] = stripped[len("name:"):].strip().strip("'\"")
+                elif stripped.startswith("entry:"):
+                    current_hook["entry"] = stripped[len("entry:"):].strip().strip("'\"")
+                elif stripped.startswith("language:"):
+                    current_hook["language"] = stripped[len("language:"):].strip().strip("'\"")
+                elif stripped.startswith("types:") or stripped.startswith("types_or:"):
+                    pass  # Ignore types for security analysis
+                elif stripped.startswith("stages:"):
+                    stages_val = stripped.split(":", 1)[1].strip()
+                    if stages_val.startswith("["):
+                        stages = [s.strip().strip("'\"") for s in stages_val.strip("[]").split(",")]
+                        current_hook["stages"] = stages
+                elif stripped.startswith("args:"):
+                    in_args = True
+                    in_additional_deps = False
+                    args_val = stripped.split(":", 1)[1].strip()
+                    if args_val.startswith("["):
+                        args = [s.strip().strip("'\"") for s in args_val.strip("[]").split(",")]
+                        current_hook["args"] = args
+                        in_args = False
+                    else:
+                        current_hook.setdefault("args", [])
+                elif stripped.startswith("additional_dependencies:"):
+                    in_additional_deps = True
+                    in_args = False
+                    current_hook.setdefault("additional_dependencies", [])
+                elif stripped.startswith("- ") and in_additional_deps:
+                    dep = stripped[2:].strip().strip("'\"")
+                    current_hook.setdefault("additional_dependencies", []).append(dep)
+                elif stripped.startswith("- ") and in_args:
+                    arg = stripped[2:].strip().strip("'\"")
+                    current_hook.setdefault("args", []).append(arg)
+                elif stripped.startswith("files:"):
+                    current_hook["files"] = stripped.split(":", 1)[1].strip().strip("'\"")
+                elif stripped.startswith("exclude:"):
+                    current_hook["exclude"] = stripped.split(":", 1)[1].strip().strip("'\"")
+                elif stripped.startswith("always_run:"):
+                    val = stripped.split(":", 1)[1].strip().lower()
+                    current_hook["always_run"] = val in ("true", "yes")
+                elif stripped.startswith("pass_filenames:"):
+                    val = stripped.split(":", 1)[1].strip().lower()
+                    current_hook["pass_filenames"] = val in ("true", "yes")
+                elif stripped.startswith("require_serial:"):
+                    val = stripped.split(":", 1)[1].strip().lower()
+                    current_hook["require_serial"] = val in ("true", "yes")
+                elif stripped.startswith("verbose:"):
+                    val = stripped.split(":", 1)[1].strip().lower()
+                    current_hook["verbose"] = val in ("true", "yes")
+    
+    # Flush last entries
+    if current_hook and current_repo:
+        current_repo["hooks"].append(current_hook)
+    if current_repo:
+        repos.append(current_repo)
+    
+    return repos
 
 
-def _scan_gitattributes(path: Path, result: ScanResult) -> None:
-    """HA012: Scan .gitattributes for dangerous filter drivers."""
-    if not path.exists():
-        return
-    result.files_scanned += 1
+# ── Scanners ──────────────────────────────────────────────────────────────────
 
-    try:
-        content = path.read_text(errors="replace")
-    except (OSError, PermissionError):
-        return
-
-    filepath = str(path)
-    lines = content.split("\n")
-
-    for line_num, line in enumerate(lines, 1):
+def scan_text_for_patterns(
+    text: str,
+    patterns: list[tuple[str, str]],
+    rule_id: str,
+    severity: str,
+    file_path: str,
+    prefix: str = "",
+) -> list[Finding]:
+    """Scan text lines for regex patterns."""
+    findings = []
+    seen = set()
+    
+    for i, line in enumerate(text.split("\n"), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-
-        # Check for filter drivers
-        filter_match = re.search(r'\bfilter\s*=\s*(\S+)', stripped)
-        if filter_match:
-            filter_name = filter_match.group(1)
-            result.findings.append(Finding(
-                rule_id="HA012",
-                severity=Severity.HIGH,
-                message=f"Git filter driver '{filter_name}' — executes code on checkout/add",
-                file=filepath,
-                line=line_num,
-                evidence=_truncate(stripped),
-            ))
-
-        # Check for diff drivers
-        diff_match = re.search(r'\bdiff\s*=\s*(\S+)', stripped)
-        if diff_match:
-            driver = diff_match.group(1)
-            result.findings.append(Finding(
-                rule_id="HA012",
-                severity=Severity.MEDIUM,
-                message=f"Custom diff driver '{driver}' — may execute code on diff",
-                file=filepath,
-                line=line_num,
-                evidence=_truncate(stripped),
-            ))
-
-        # Check for merge drivers
-        merge_match = re.search(r'\bmerge\s*=\s*(\S+)', stripped)
-        if merge_match:
-            driver = merge_match.group(1)
-            result.findings.append(Finding(
-                rule_id="HA012",
-                severity=Severity.MEDIUM,
-                message=f"Custom merge driver '{driver}' — may execute code on merge",
-                file=filepath,
-                line=line_num,
-                evidence=_truncate(stripped),
-            ))
-
-
-def _scan_git_config(path: Path, result: ScanResult) -> None:
-    """HA013: Scan .git/config or .gitconfig for dangerous settings."""
-    if not path.exists():
-        return
-    result.files_scanned += 1
-
-    try:
-        content = path.read_text(errors="replace")
-    except (OSError, PermissionError):
-        return
-
-    filepath = str(path)
-    lines = content.split("\n")
-
-    dangerous_keys = {
-        "core.hookspath": (Severity.HIGH, "custom hooks path — hooks could come from anywhere"),
-        "core.fsmonitor": (Severity.CRITICAL, "fsmonitor — executes command on every git operation"),
-        "core.pager": (Severity.MEDIUM, "custom pager — could execute arbitrary code"),
-        "core.editor": (Severity.LOW, "custom editor — could be malicious binary"),
-        "core.sshcommand": (Severity.HIGH, "custom SSH command — could intercept credentials"),
-        "credential.helper": (Severity.HIGH, "credential helper — could steal credentials"),
-        "diff.*.textconv": (Severity.HIGH, "textconv — executes command on diff"),
-        "merge.*.driver": (Severity.HIGH, "merge driver — executes command on merge"),
-        "filter.*.clean": (Severity.HIGH, "filter clean — executes on git add"),
-        "filter.*.smudge": (Severity.HIGH, "filter smudge — executes on git checkout"),
-        "filter.*.process": (Severity.HIGH, "filter process — long-running filter command"),
-    }
-
-    current_section = ""
-    for line_num, line in enumerate(lines, 1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or stripped.startswith(";"):
-            continue
-
-        # Track sections
-        section_match = re.match(r'\[(\S+?)(?:\s+"([^"]+)")?\]', stripped)
-        if section_match:
-            current_section = section_match.group(1).lower()
-            if section_match.group(2):
-                current_section += "." + section_match.group(2)
-            continue
-
-        # Check key=value pairs
-        kv_match = re.match(r'\s*(\w+)\s*=\s*(.*)', stripped)
-        if not kv_match:
-            continue
-
-        key = kv_match.group(1).lower()
-        value = kv_match.group(2).strip()
-        full_key = f"{current_section}.{key}"
-
-        # Check exact matches
-        for pattern, (severity, desc) in dangerous_keys.items():
-            if "*" in pattern:
-                # Wildcard match: filter.*.clean matches filter.lfs.clean
-                parts = pattern.split("*")
-                if full_key.startswith(parts[0].rstrip(".")) and full_key.endswith(parts[1].lstrip(".")):
-                    result.findings.append(Finding(
-                        rule_id="HA013",
+        for pattern, desc in patterns:
+            if re.search(pattern, stripped, re.IGNORECASE):
+                key = (rule_id, desc, file_path, i)
+                if key not in seen:
+                    seen.add(key)
+                    msg = f"{prefix}{desc}" if prefix else desc
+                    findings.append(Finding(
+                        rule_id=rule_id,
                         severity=severity,
-                        message=f"Dangerous git config: {desc}",
-                        file=filepath,
-                        line=line_num,
-                        evidence=_truncate(f"{full_key} = {value}"),
+                        message=msg,
+                        file=file_path,
+                        line=i,
+                        context=stripped[:120],
                     ))
-                    break
-            elif full_key == pattern:
-                result.findings.append(Finding(
-                    rule_id="HA013",
-                    severity=severity,
-                    message=f"Dangerous git config: {desc}",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(f"{full_key} = {value}"),
-                ))
-                break
-
-        # Check for URLs with embedded credentials
-        if re.search(r'https?://[^@\s]+:[^@\s]+@', value):
-            result.findings.append(Finding(
-                rule_id="HA013",
-                severity=Severity.HIGH,
-                message="Embedded credentials in git config URL",
-                file=filepath,
-                line=line_num,
-                evidence=_truncate(stripped),
-            ))
+    return findings
 
 
-def _scan_husky(repo_root: Path, result: ScanResult) -> None:
-    """HA014: Scan Husky hook configurations."""
-    husky_dir = repo_root / ".husky"
-    if not husky_dir.is_dir():
-        return
-
-    for item in husky_dir.iterdir():
-        if item.is_file() and item.name != "_" and not item.name.startswith("."):
-            result.files_scanned += 1
-            result.hooks_found += 1
-            try:
-                content = item.read_text(errors="replace")
-            except (OSError, PermissionError):
-                continue
-            _scan_content(content, str(item), result)
-
-    # Check .husky/_/husky.sh
-    husky_sh = husky_dir / "_" / "husky.sh"
-    if husky_sh.exists():
-        result.files_scanned += 1
-        try:
-            content = husky_sh.read_text(errors="replace")
-        except (OSError, PermissionError):
-            return
-        _scan_content(content, str(husky_sh), result)
-
-
-def _scan_precommit_config(repo_root: Path, result: ScanResult) -> None:
-    """HA015: Scan .pre-commit-config.yaml for suspicious repos."""
-    config_path = repo_root / ".pre-commit-config.yaml"
-    if not config_path.exists():
-        return
-    result.files_scanned += 1
-
+def scan_precommit_config(path: Path, ignored: set[str]) -> list[Finding]:
+    """Scan .pre-commit-config.yaml for security issues."""
+    findings = []
+    
     try:
-        content = config_path.read_text(errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, PermissionError):
-        return
-
-    filepath = str(config_path)
-    lines = content.split("\n")
-
-    for line_num, line in enumerate(lines, 1):
-        stripped = line.strip()
-
-        # Check for repos pointing to non-GitHub/non-trusted sources
-        repo_match = re.search(r'repo:\s*(https?://\S+)', stripped)
-        if repo_match:
-            url = repo_match.group(1)
-            # Flag non-standard hosts
-            trusted_hosts = [
-                "github.com", "gitlab.com", "bitbucket.org",
-            ]
-            is_trusted = any(host in url for host in trusted_hosts)
-            if not is_trusted:
-                result.findings.append(Finding(
-                    rule_id="HA015",
+        return findings
+    
+    repos = parse_yaml_simple(text)
+    rel_path = str(path)
+    
+    total_hooks = 0
+    
+    for repo_entry in repos:
+        repo_url = repo_entry.get("repo", "")
+        rev = repo_entry.get("rev", "")
+        repo_line = repo_entry.get("_line", 0)
+        hooks = repo_entry.get("hooks", [])
+        total_hooks += len(hooks)
+        
+        # Skip meta/local repos for some checks
+        is_local = repo_url in ("local", "meta")
+        
+        if not is_local:
+            # HK009: Missing rev
+            if "HK009" not in ignored and not rev:
+                findings.append(Finding(
+                    rule_id="HK009",
                     severity=Severity.MEDIUM,
-                    message=f"Pre-commit repo from untrusted host",
-                    file=filepath,
-                    line=line_num,
-                    evidence=_truncate(url),
+                    message=f"No version pinned for repo: {repo_url}",
+                    file=rel_path,
+                    line=repo_line,
+                    fix="Add 'rev:' with a specific tag or SHA commit hash",
                 ))
-
-        # Check for local repos with suspicious paths
-        local_match = re.search(r'repo:\s*(local|/)', stripped)
-        if local_match:
-            result.findings.append(Finding(
-                rule_id="HA015",
-                severity=Severity.LOW,
-                message="Pre-commit config uses local repo — verify hook code",
-                file=filepath,
-                line=line_num,
-                evidence=_truncate(stripped),
-            ))
-
-        # Check for entry commands that look dangerous
-        entry_match = re.search(r'entry:\s*(.+)', stripped)
-        if entry_match:
-            entry_cmd = entry_match.group(1).strip()
-            for pattern in DOWNLOAD_EXEC_PATTERNS:
-                if pattern.search(entry_cmd):
-                    result.findings.append(Finding(
-                        rule_id="HA015",
-                        severity=Severity.CRITICAL,
-                        message="Pre-commit hook entry with download-and-execute",
-                        file=filepath,
-                        line=line_num,
-                        evidence=_truncate(entry_cmd),
+            
+            # HK005: Unpinned rev (not SHA)
+            if "HK005" not in ignored and rev and not SHA_RE.match(rev):
+                findings.append(Finding(
+                    rule_id="HK005",
+                    severity=Severity.HIGH,
+                    message=f"Repo uses tag/branch '{rev}' instead of pinned SHA: {repo_url}",
+                    file=rel_path,
+                    line=repo_line,
+                    context=f"rev: {rev}",
+                    fix=f"Pin to a full SHA commit hash: `pre-commit autoupdate --freeze`",
+                ))
+            
+            # HK006: Untrusted repo
+            if "HK006" not in ignored:
+                is_trusted = False
+                for domain in TRUSTED_DOMAINS:
+                    if domain in repo_url:
+                        # Check org/owner
+                        parts = repo_url.split("/")
+                        for part in parts:
+                            for org in TRUSTED_ORGS:
+                                if org.startswith("mirrors-"):
+                                    if part.startswith("mirrors-"):
+                                        is_trusted = True
+                                        break
+                                elif part.lower() == org.lower():
+                                    is_trusted = True
+                                    break
+                            if is_trusted:
+                                break
+                
+                if not is_trusted and repo_url not in ("local", "meta"):
+                    findings.append(Finding(
+                        rule_id="HK006",
+                        severity=Severity.HIGH,
+                        message=f"Hook from unverified repository: {repo_url}",
+                        file=rel_path,
+                        line=repo_line,
+                        fix="Verify the repository is maintained by a trusted organization. Consider forking to your org.",
                     ))
-                    break
+        
+        # Scan hooks
+        for hook in hooks:
+            hook_id = hook.get("id", "unknown")
+            hook_line = hook.get("_line", repo_line)
+            entry = hook.get("entry", "")
+            language = hook.get("language", "")
+            
+            # For local hooks, scan entry for dangerous patterns
+            if is_local and entry:
+                # HK007: Local hook with dangerous commands
+                if "HK007" not in ignored:
+                    for pattern, desc in SHELL_INJECTION_PATTERNS:
+                        if re.search(pattern, entry, re.IGNORECASE):
+                            findings.append(Finding(
+                                rule_id="HK007",
+                                severity=Severity.HIGH,
+                                message=f"Local hook '{hook_id}' has dangerous entry: {desc}",
+                                file=rel_path,
+                                line=hook_line,
+                                context=entry[:120],
+                                fix="Review the hook entry command for safety",
+                            ))
+                            break
+                
+                # HK001: Shell injection in entry
+                if "HK001" not in ignored:
+                    for pattern, desc in SHELL_INJECTION_PATTERNS:
+                        if re.search(pattern, entry, re.IGNORECASE):
+                            findings.append(Finding(
+                                rule_id="HK001",
+                                severity=Severity.CRITICAL,
+                                message=f"Shell injection in local hook '{hook_id}': {desc}",
+                                file=rel_path,
+                                line=hook_line,
+                                context=entry[:120],
+                            ))
+                            break
+                
+                # HK004: Credential access in entry
+                if "HK004" not in ignored:
+                    for pattern, desc in CREDENTIAL_ACCESS_PATTERNS:
+                        if re.search(pattern, entry, re.IGNORECASE):
+                            findings.append(Finding(
+                                rule_id="HK004",
+                                severity=Severity.CRITICAL,
+                                message=f"Hook '{hook_id}' accesses credentials: {desc}",
+                                file=rel_path,
+                                line=hook_line,
+                                context=entry[:120],
+                            ))
+                            break
+            
+            # HK018: Dangerous language for hooks
+            if "HK018" not in ignored and language in ("system", "script", "docker"):
+                findings.append(Finding(
+                    rule_id="HK018",
+                    severity=Severity.MEDIUM,
+                    message=f"Hook '{hook_id}' uses '{language}' language (high exploitation risk)",
+                    file=rel_path,
+                    line=hook_line,
+                    fix=f"'{language}' hooks run arbitrary commands. Verify the source carefully.",
+                ))
+            
+            # Scan args for dangerous patterns
+            args = hook.get("args", [])
+            args_text = " ".join(str(a) for a in args)
+            if args_text:
+                if "HK001" not in ignored:
+                    for pattern, desc in SHELL_INJECTION_PATTERNS:
+                        if re.search(pattern, args_text, re.IGNORECASE):
+                            findings.append(Finding(
+                                rule_id="HK001",
+                                severity=Severity.CRITICAL,
+                                message=f"Shell injection in hook '{hook_id}' args: {desc}",
+                                file=rel_path,
+                                line=hook_line,
+                                context=args_text[:120],
+                            ))
+                            break
+    
+    # HK016: Excessive hooks
+    if "HK016" not in ignored and total_hooks > 20:
+        findings.append(Finding(
+            rule_id="HK016",
+            severity=Severity.LOW,
+            message=f"Large number of hooks ({total_hooks}) increases attack surface",
+            file=rel_path,
+            fix="Review whether all hooks are necessary. Each hook is a potential supply chain vector.",
+        ))
+    
+    # Scan full text for secrets
+    if "HK017" not in ignored:
+        findings.extend(scan_text_for_patterns(
+            text, SECRET_PATTERNS, "HK017", Severity.HIGH,
+            rel_path, prefix="Embedded secret in config: ",
+        ))
+    
+    return findings
 
-            for pattern in REVERSE_SHELL_PATTERNS:
-                if pattern.search(entry_cmd):
-                    result.findings.append(Finding(
-                        rule_id="HA015",
-                        severity=Severity.CRITICAL,
-                        message="Pre-commit hook entry with reverse shell",
-                        file=filepath,
-                        line=line_num,
-                        evidence=_truncate(entry_cmd),
-                    ))
-                    break
 
-
-def _scan_lefthook(repo_root: Path, result: ScanResult) -> None:
-    """HA016: Scan lefthook configs for suspicious commands."""
-    for name in ("lefthook.yml", ".lefthook.yml", "lefthook.yaml", ".lefthook.yaml"):
-        config_path = repo_root / name
-        if config_path.exists():
-            result.files_scanned += 1
-            try:
-                content = config_path.read_text(errors="replace")
-            except (OSError, PermissionError):
-                continue
-
-            filepath = str(config_path)
-            lines = content.split("\n")
-
-            for line_num, line in enumerate(lines, 1):
-                stripped = line.strip()
-                # Check run commands
-                run_match = re.search(r'run:\s*(.+)', stripped)
-                if run_match:
-                    cmd = run_match.group(1).strip()
-                    # Apply all dangerous pattern checks to the command
-                    _scan_content(cmd, filepath, result)
-                    # Overwrite line numbers on any findings just added
-                    for f in result.findings:
-                        if f.file == filepath and f.line == 1:
-                            f.line = line_num
-
-
-def _scan_hook_scripts(repo_root: Path, result: ScanResult) -> None:
-    """Scan .git/hooks/ and .githooks/ for malicious content."""
-
-    hook_dirs = [
-        repo_root / ".git" / "hooks",
-        repo_root / ".githooks",
-    ]
-
-    # Also check if core.hooksPath is set to something custom
-    git_config = repo_root / ".git" / "config"
-    if git_config.exists():
+def scan_git_hooks_dir(hooks_dir: Path, ignored: set[str]) -> list[Finding]:
+    """Scan .git/hooks/ directory for custom hook scripts."""
+    findings = []
+    
+    if not hooks_dir.is_dir():
+        return findings
+    
+    # HK020: Check directory permissions
+    if "HK020" not in ignored:
         try:
-            config_content = git_config.read_text(errors="replace")
-            hooks_path_match = re.search(r'hookspath\s*=\s*(.+)', config_content, re.I)
-            if hooks_path_match:
-                custom_path = Path(hooks_path_match.group(1).strip())
-                if not custom_path.is_absolute():
-                    custom_path = repo_root / custom_path
-                if custom_path.is_dir() and custom_path not in hook_dirs:
-                    hook_dirs.append(custom_path)
-        except (OSError, PermissionError):
+            mode = hooks_dir.stat().st_mode
+            if mode & stat.S_IWOTH:
+                findings.append(Finding(
+                    rule_id="HK020",
+                    severity=Severity.MEDIUM,
+                    message="Hooks directory is world-writable",
+                    file=str(hooks_dir),
+                    fix="chmod 755 .git/hooks/",
+                ))
+        except OSError:
             pass
-
-    for hooks_dir in hook_dirs:
-        if not hooks_dir.is_dir():
+    
+    # Known git hook names
+    hook_names = {
+        "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+        "pre-rebase", "post-rewrite", "post-checkout", "post-merge",
+        "pre-push", "pre-receive", "update", "post-receive",
+        "post-update", "push-to-checkout", "pre-auto-gc",
+        "fsmonitor-watchman", "p4-changelist", "p4-prepare-changelist",
+        "p4-post-changelist", "p4-pre-submit", "sendemail-validate",
+        "applypatch-msg", "pre-applypatch", "post-applypatch",
+        "reference-transaction",
+    }
+    
+    for item in sorted(hooks_dir.iterdir()):
+        if not item.is_file():
             continue
+        
+        name = item.name
+        
+        # Skip .sample files
+        if name.endswith(".sample"):
+            continue
+        
+        rel_path = str(item)
+        
+        # HK019: Custom hook found
+        if "HK019" not in ignored and name in hook_names:
+            findings.append(Finding(
+                rule_id="HK019",
+                severity=Severity.INFO,
+                message=f"Custom git hook script: {name}",
+                file=rel_path,
+            ))
+        
+        # Read and scan the script
+        try:
+            text = item.read_text(encoding="utf-8", errors="replace")
+        except (OSError, PermissionError):
+            continue
+        
+        # HK001: Shell injection
+        if "HK001" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SHELL_INJECTION_PATTERNS, "HK001", Severity.CRITICAL,
+                rel_path, prefix="Shell injection in hook: ",
+            ))
+        
+        # HK002: Reverse shell
+        if "HK002" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, REVERSE_SHELL_PATTERNS, "HK002", Severity.CRITICAL,
+                rel_path, prefix="Reverse shell pattern: ",
+            ))
+        
+        # HK003: Data exfiltration
+        if "HK003" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, EXFILTRATION_PATTERNS, "HK003", Severity.CRITICAL,
+                rel_path, prefix="Data exfiltration: ",
+            ))
+        
+        # HK004: Credential access
+        if "HK004" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, CREDENTIAL_ACCESS_PATTERNS, "HK004", Severity.CRITICAL,
+                rel_path, prefix="Credential access: ",
+            ))
+        
+        # HK008: Hidden payload
+        if "HK008" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, HIDDEN_PAYLOAD_PATTERNS, "HK008", Severity.HIGH,
+                rel_path, prefix="Hidden payload: ",
+            ))
+        
+        # HK010: Filesystem escape
+        if "HK010" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, FILESYSTEM_ESCAPE_PATTERNS, "HK010", Severity.MEDIUM,
+                rel_path, prefix="Filesystem escape: ",
+            ))
+        
+        # HK011: Sudo
+        if "HK011" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SUDO_PATTERNS, "HK011", Severity.MEDIUM,
+                rel_path, prefix="Privilege escalation: ",
+            ))
+        
+        # HK012: Network access
+        if "HK012" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, NETWORK_PATTERNS, "HK012", Severity.MEDIUM,
+                rel_path, prefix="Network access: ",
+            ))
+        
+        # HK013: File modification
+        if "HK013" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, FILE_MOD_PATTERNS, "HK013", Severity.MEDIUM,
+                rel_path, prefix="Dangerous file operation: ",
+            ))
+        
+        # HK014: Env manipulation
+        if "HK014" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, ENV_MANIPULATION_PATTERNS, "HK014", Severity.MEDIUM,
+                rel_path, prefix="Environment manipulation: ",
+            ))
+        
+        # HK017: Secrets
+        if "HK017" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SECRET_PATTERNS, "HK017", Severity.HIGH,
+                rel_path, prefix="Embedded secret: ",
+            ))
+    
+    return findings
 
-        for item in hooks_dir.iterdir():
+
+def scan_husky(project_dir: Path, ignored: set[str]) -> list[Finding]:
+    """Scan Husky git hook configuration (.husky/ directory)."""
+    findings = []
+    
+    husky_dir = project_dir / ".husky"
+    if not husky_dir.is_dir():
+        return findings
+    
+    hook_files = [
+        "pre-commit", "commit-msg", "pre-push", "post-checkout",
+        "post-commit", "post-merge", "pre-rebase",
+    ]
+    
+    for name in hook_files:
+        hook_file = husky_dir / name
+        if not hook_file.is_file():
+            continue
+        
+        rel_path = str(hook_file)
+        
+        try:
+            text = hook_file.read_text(encoding="utf-8", errors="replace")
+        except (OSError, PermissionError):
+            continue
+        
+        # HK019: Hook found
+        if "HK019" not in ignored:
+            findings.append(Finding(
+                rule_id="HK019",
+                severity=Severity.INFO,
+                message=f"Husky hook script: {name}",
+                file=rel_path,
+            ))
+        
+        # Scan for all patterns
+        if "HK001" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SHELL_INJECTION_PATTERNS, "HK001", Severity.CRITICAL,
+                rel_path, prefix="Shell injection in husky hook: ",
+            ))
+        if "HK002" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, REVERSE_SHELL_PATTERNS, "HK002", Severity.CRITICAL,
+                rel_path, prefix="Reverse shell in husky hook: ",
+            ))
+        if "HK003" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, EXFILTRATION_PATTERNS, "HK003", Severity.CRITICAL,
+                rel_path, prefix="Exfiltration in husky hook: ",
+            ))
+        if "HK004" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, CREDENTIAL_ACCESS_PATTERNS, "HK004", Severity.CRITICAL,
+                rel_path, prefix="Credential access in husky hook: ",
+            ))
+        if "HK008" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, HIDDEN_PAYLOAD_PATTERNS, "HK008", Severity.HIGH,
+                rel_path, prefix="Hidden payload in husky hook: ",
+            ))
+        if "HK011" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SUDO_PATTERNS, "HK011", Severity.MEDIUM,
+                rel_path, prefix="Privilege escalation in husky hook: ",
+            ))
+        if "HK012" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, NETWORK_PATTERNS, "HK012", Severity.MEDIUM,
+                rel_path, prefix="Network access in husky hook: ",
+            ))
+        if "HK013" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, FILE_MOD_PATTERNS, "HK013", Severity.MEDIUM,
+                rel_path, prefix="Dangerous file op in husky hook: ",
+            ))
+        if "HK014" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, ENV_MANIPULATION_PATTERNS, "HK014", Severity.MEDIUM,
+                rel_path, prefix="Env manipulation in husky hook: ",
+            ))
+        if "HK017" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SECRET_PATTERNS, "HK017", Severity.HIGH,
+                rel_path, prefix="Embedded secret in husky hook: ",
+            ))
+    
+    # Also check _/ directory (husky v9+)
+    husky_internal = husky_dir / "_"
+    if husky_internal.is_dir():
+        for item in sorted(husky_internal.iterdir()):
             if not item.is_file():
                 continue
-
-            # Skip .sample files
-            if item.suffix == ".sample":
-                continue
-
-            result.files_scanned += 1
-
-            # Check if it's a known hook name
-            hook_name = item.stem if item.suffix else item.name
-            if hook_name in KNOWN_HOOKS:
-                result.hooks_found += 1
-
-                # HA017: Check if hook is in a high-risk category
-                if hook_name in HIGH_RISK_HOOKS:
-                    result.findings.append(Finding(
-                        rule_id="HA017",
-                        severity=Severity.INFO,
-                        message=f"Auto-triggered hook: {hook_name} runs on common git operations",
-                        file=str(item),
-                    ))
-
-            # Check executable bit
             try:
-                mode = item.stat().st_mode
-                if mode & stat.S_IXUSR:
-                    pass  # Expected
-                else:
-                    result.findings.append(Finding(
-                        rule_id="HA017",
-                        severity=Severity.INFO,
-                        message=f"Hook file is not executable (won't run)",
-                        file=str(item),
-                    ))
-            except OSError:
-                pass
-
-            # Read and scan content
-            try:
-                content = item.read_text(errors="replace")
+                text = item.read_text(encoding="utf-8", errors="replace")
             except (OSError, PermissionError):
                 continue
-
-            _scan_content(content, str(item), result)
-
-            # HA018: Check for binary content in hooks
-            try:
-                raw = item.read_bytes()
-                if b"\x00" in raw[:512]:
-                    result.findings.append(Finding(
-                        rule_id="HA018",
-                        severity=Severity.HIGH,
-                        message="Binary content in hook file — could be compiled malware",
-                        file=str(item),
-                    ))
-            except (OSError, PermissionError):
-                pass
+            rel_path = str(item)
+            if "HK001" not in ignored:
+                findings.extend(scan_text_for_patterns(
+                    text, SHELL_INJECTION_PATTERNS, "HK001", Severity.CRITICAL,
+                    rel_path, prefix="Shell injection in husky internal: ",
+                ))
+    
+    return findings
 
 
-def scan_repo(repo_root: Path) -> ScanResult:
-    """Scan a git repository for dangerous hooks and configs."""
-    result = ScanResult()
-
-    if not repo_root.is_dir():
-        result.findings.append(Finding(
-            rule_id="HA000",
-            severity=Severity.INFO,
-            message=f"Not a directory: {repo_root}",
-            file=str(repo_root),
-        ))
-        return result
-
-    # Scan hook scripts (.git/hooks, .githooks, custom hookspath)
-    _scan_hook_scripts(repo_root, result)
-
-    # Scan .gitattributes
-    for ga in [repo_root / ".gitattributes"]:
-        _scan_gitattributes(ga, result)
-    # Also check subdirectory .gitattributes
-    try:
-        for ga in repo_root.rglob(".gitattributes"):
-            if ".git" not in ga.parts:
-                _scan_gitattributes(ga, result)
-    except (OSError, PermissionError):
-        pass
-
-    # Scan git config
-    _scan_git_config(repo_root / ".git" / "config", result)
-
-    # Scan husky
-    _scan_husky(repo_root, result)
-
-    # Scan pre-commit config
-    _scan_precommit_config(repo_root, result)
-
-    # Scan lefthook
-    _scan_lefthook(repo_root, result)
-
-    return result
-
-
-def scan_file(filepath: Path) -> ScanResult:
-    """Scan a single file for dangerous patterns."""
-    result = ScanResult()
-
-    if not filepath.is_file():
-        result.findings.append(Finding(
-            rule_id="HA000",
-            severity=Severity.INFO,
-            message=f"Not a file: {filepath}",
-            file=str(filepath),
-        ))
-        return result
-
-    result.files_scanned = 1
-
-    name = filepath.name
-    if name == ".gitattributes":
-        _scan_gitattributes(filepath, result)
-    elif name in ("config", ".gitconfig"):
-        _scan_git_config(filepath, result)
-    elif name == ".pre-commit-config.yaml":
-        _scan_precommit_config(filepath.parent, result)
-    elif name in ("lefthook.yml", ".lefthook.yml", "lefthook.yaml", ".lefthook.yaml"):
-        _scan_lefthook(filepath.parent, result)
-    else:
+def scan_lefthook(project_dir: Path, ignored: set[str]) -> list[Finding]:
+    """Scan lefthook configuration (lefthook.yml / lefthook-local.yml)."""
+    findings = []
+    
+    lefthook_files = ["lefthook.yml", "lefthook-local.yml", ".lefthook.yml"]
+    
+    for fname in lefthook_files:
+        fpath = project_dir / fname
+        if not fpath.is_file():
+            continue
+        
         try:
-            content = filepath.read_text(errors="replace")
+            text = fpath.read_text(encoding="utf-8", errors="replace")
         except (OSError, PermissionError):
-            return result
-        _scan_content(content, str(filepath), result)
-        result.hooks_found = 1
+            continue
+        
+        rel_path = str(fpath)
+        
+        # HK019: Lefthook config found
+        if "HK019" not in ignored:
+            findings.append(Finding(
+                rule_id="HK019",
+                severity=Severity.INFO,
+                message=f"Lefthook configuration: {fname}",
+                file=rel_path,
+            ))
+        
+        # Scan for dangerous patterns in run: commands
+        if "HK001" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SHELL_INJECTION_PATTERNS, "HK001", Severity.CRITICAL,
+                rel_path, prefix="Shell injection in lefthook: ",
+            ))
+        if "HK002" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, REVERSE_SHELL_PATTERNS, "HK002", Severity.CRITICAL,
+                rel_path, prefix="Reverse shell in lefthook: ",
+            ))
+        if "HK003" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, EXFILTRATION_PATTERNS, "HK003", Severity.CRITICAL,
+                rel_path, prefix="Exfiltration in lefthook: ",
+            ))
+        if "HK004" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, CREDENTIAL_ACCESS_PATTERNS, "HK004", Severity.CRITICAL,
+                rel_path, prefix="Credential access in lefthook: ",
+            ))
+        if "HK008" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, HIDDEN_PAYLOAD_PATTERNS, "HK008", Severity.HIGH,
+                rel_path, prefix="Hidden payload in lefthook: ",
+            ))
+        if "HK011" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SUDO_PATTERNS, "HK011", Severity.MEDIUM,
+                rel_path, prefix="Privilege escalation in lefthook: ",
+            ))
+        if "HK012" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, NETWORK_PATTERNS, "HK012", Severity.MEDIUM,
+                rel_path, prefix="Network access in lefthook: ",
+            ))
+        if "HK017" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SECRET_PATTERNS, "HK017", Severity.HIGH,
+                rel_path, prefix="Embedded secret in lefthook: ",
+            ))
+    
+    return findings
 
-    return result
+
+def scan_lint_staged(project_dir: Path, ignored: set[str]) -> list[Finding]:
+    """Scan lint-staged configuration (package.json, .lintstagedrc*)."""
+    findings = []
+    
+    # Check package.json for lint-staged config
+    pkg_json = project_dir / "package.json"
+    if pkg_json.is_file():
+        try:
+            text = pkg_json.read_text(encoding="utf-8", errors="replace")
+            data = json.loads(text)
+            lint_staged = data.get("lint-staged", {})
+            if lint_staged:
+                # Scan commands in lint-staged config
+                for glob_pattern, commands in lint_staged.items():
+                    if isinstance(commands, str):
+                        commands = [commands]
+                    if isinstance(commands, list):
+                        for cmd in commands:
+                            if not isinstance(cmd, str):
+                                continue
+                            # Check for dangerous commands
+                            if "HK001" not in ignored:
+                                for pattern, desc in SHELL_INJECTION_PATTERNS:
+                                    if re.search(pattern, cmd, re.IGNORECASE):
+                                        findings.append(Finding(
+                                            rule_id="HK001",
+                                            severity=Severity.CRITICAL,
+                                            message=f"Shell injection in lint-staged ({glob_pattern}): {desc}",
+                                            file=str(pkg_json),
+                                            context=cmd[:120],
+                                        ))
+                                        break
+                            if "HK004" not in ignored:
+                                for pattern, desc in CREDENTIAL_ACCESS_PATTERNS:
+                                    if re.search(pattern, cmd, re.IGNORECASE):
+                                        findings.append(Finding(
+                                            rule_id="HK004",
+                                            severity=Severity.CRITICAL,
+                                            message=f"Credential access in lint-staged ({glob_pattern}): {desc}",
+                                            file=str(pkg_json),
+                                            context=cmd[:120],
+                                        ))
+                                        break
+        except (json.JSONDecodeError, OSError, PermissionError):
+            pass
+    
+    # Check standalone lint-staged configs
+    lint_staged_files = [
+        ".lintstagedrc", ".lintstagedrc.json", ".lintstagedrc.yaml",
+        ".lintstagedrc.yml", ".lintstagedrc.mjs", ".lintstagedrc.cjs",
+        "lint-staged.config.js", "lint-staged.config.mjs", "lint-staged.config.cjs",
+    ]
+    
+    for fname in lint_staged_files:
+        fpath = project_dir / fname
+        if not fpath.is_file():
+            continue
+        
+        try:
+            text = fpath.read_text(encoding="utf-8", errors="replace")
+        except (OSError, PermissionError):
+            continue
+        
+        rel_path = str(fpath)
+        
+        if "HK001" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SHELL_INJECTION_PATTERNS, "HK001", Severity.CRITICAL,
+                rel_path, prefix="Shell injection in lint-staged config: ",
+            ))
+        if "HK004" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, CREDENTIAL_ACCESS_PATTERNS, "HK004", Severity.CRITICAL,
+                rel_path, prefix="Credential access in lint-staged config: ",
+            ))
+        if "HK017" not in ignored:
+            findings.extend(scan_text_for_patterns(
+                text, SECRET_PATTERNS, "HK017", Severity.HIGH,
+                rel_path, prefix="Embedded secret in lint-staged config: ",
+            ))
+    
+    return findings
 
 
-# ── Output Formatting ───────────────────────────────────────────────
+def scan_overcommit(project_dir: Path, ignored: set[str]) -> list[Finding]:
+    """Scan overcommit configuration (.overcommit.yml)."""
+    findings = []
+    
+    overcommit = project_dir / ".overcommit.yml"
+    if not overcommit.is_file():
+        return findings
+    
+    try:
+        text = overcommit.read_text(encoding="utf-8", errors="replace")
+    except (OSError, PermissionError):
+        return findings
+    
+    rel_path = str(overcommit)
+    
+    if "HK019" not in ignored:
+        findings.append(Finding(
+            rule_id="HK019",
+            severity=Severity.INFO,
+            message="Overcommit configuration found",
+            file=rel_path,
+        ))
+    
+    if "HK001" not in ignored:
+        findings.extend(scan_text_for_patterns(
+            text, SHELL_INJECTION_PATTERNS, "HK001", Severity.CRITICAL,
+            rel_path, prefix="Shell injection in overcommit: ",
+        ))
+    if "HK004" not in ignored:
+        findings.extend(scan_text_for_patterns(
+            text, CREDENTIAL_ACCESS_PATTERNS, "HK004", Severity.CRITICAL,
+            rel_path, prefix="Credential access in overcommit: ",
+        ))
+    if "HK017" not in ignored:
+        findings.extend(scan_text_for_patterns(
+            text, SECRET_PATTERNS, "HK017", Severity.HIGH,
+            rel_path, prefix="Embedded secret in overcommit: ",
+        ))
+    
+    return findings
 
-# ANSI colors
-RED = "\033[91m"
-YELLOW = "\033[93m"
-GREEN = "\033[92m"
-CYAN = "\033[96m"
-GRAY = "\033[90m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-MAGENTA = "\033[95m"
+
+# ── Grading ───────────────────────────────────────────────────────────────────
+
+def calculate_grade(findings: list[Finding]) -> tuple[str, int]:
+    """Calculate A-F grade from findings."""
+    score = 100
+    
+    for f in findings:
+        sev = f.severity
+        if sev == Severity.CRITICAL:
+            score -= 25
+        elif sev == Severity.HIGH:
+            score -= 15
+        elif sev == Severity.MEDIUM:
+            score -= 8
+        elif sev == Severity.LOW:
+            score -= 3
+        # INFO doesn't affect score
+    
+    score = max(0, score)
+    
+    if score >= 97:
+        grade = "A+"
+    elif score >= 90:
+        grade = "A"
+    elif score >= 80:
+        grade = "B"
+    elif score >= 70:
+        grade = "C"
+    elif score >= 60:
+        grade = "D"
+    else:
+        grade = "F"
+    
+    return grade, score
+
+
+# ── Output Formatters ─────────────────────────────────────────────────────────
 
 SEVERITY_COLORS = {
-    Severity.CRITICAL: RED,
-    Severity.HIGH: YELLOW,
-    Severity.MEDIUM: MAGENTA,
-    Severity.LOW: CYAN,
-    Severity.INFO: GRAY,
+    Severity.CRITICAL: "\033[91m",  # Red
+    Severity.HIGH: "\033[93m",      # Yellow
+    Severity.MEDIUM: "\033[33m",    # Orange-ish
+    Severity.LOW: "\033[36m",       # Cyan
+    Severity.INFO: "\033[90m",      # Gray
+}
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+SEVERITY_SYMBOLS = {
+    Severity.CRITICAL: "✖",
+    Severity.HIGH: "✖",
+    Severity.MEDIUM: "▲",
+    Severity.LOW: "●",
+    Severity.INFO: "ℹ",
 }
 
 
-def _supports_color() -> bool:
-    if os.getenv("NO_COLOR"):
-        return False
-    if os.getenv("FORCE_COLOR"):
-        return True
-    return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
-
-
-def format_text(result: ScanResult, verbose: bool = False, color: bool = True) -> str:
-    """Format scan result as human-readable text."""
-    use_color = color and _supports_color()
-
-    def c(code: str, text: str) -> str:
-        return f"{code}{text}{RESET}" if use_color else text
-
-    lines: List[str] = []
-
+def format_text(
+    findings: list[Finding],
+    grade: str,
+    score: int,
+    verbose: bool = False,
+    use_color: bool = True,
+) -> str:
+    """Format findings as human-readable text."""
+    lines = []
+    
     # Header
-    grade = result.grade
-    risk = result.risk_label
-    score = result.risk_score
-
-    grade_color = GREEN if grade.startswith("A") else (YELLOW if grade in ("B", "C") else RED)
-    risk_color = GREEN if risk == "SAFE" else (YELLOW if risk in ("LOW", "MODERATE") else RED)
-
-    lines.append(c(BOLD, "hookaudit") + f" — Git Hook Security Audit")
+    if use_color:
+        lines.append(f"\n{BOLD}hookaudit{RESET} — Git Hook Security Auditor\n")
+    else:
+        lines.append("\nhookaudit — Git Hook Security Auditor\n")
+    
+    # Grade
+    grade_color = ""
+    if use_color:
+        if score >= 90:
+            grade_color = "\033[92m"  # Green
+        elif score >= 70:
+            grade_color = "\033[93m"  # Yellow
+        elif score >= 50:
+            grade_color = "\033[33m"  # Orange
+        else:
+            grade_color = "\033[91m"  # Red
+    
+    if use_color:
+        lines.append(f"  Grade: {grade_color}{BOLD}{grade}{RESET} ({score}/100)")
+    else:
+        lines.append(f"  Grade: {grade} ({score}/100)")
+    
+    # Summary counts
+    counts = {}
+    for f in findings:
+        counts[f.severity] = counts.get(f.severity, 0) + 1
+    
+    summary_parts = []
+    for sev in [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW, Severity.INFO]:
+        if sev in counts:
+            if use_color:
+                summary_parts.append(f"{SEVERITY_COLORS[sev]}{counts[sev]} {sev.lower()}{RESET}")
+            else:
+                summary_parts.append(f"{counts[sev]} {sev.lower()}")
+    
+    if summary_parts:
+        lines.append(f"  Findings: {', '.join(summary_parts)}")
+    else:
+        lines.append("  Findings: none")
+    
     lines.append("")
-    lines.append(f"  Grade: {c(grade_color, c(BOLD, grade))}  Risk: {c(risk_color, risk)} ({score}/100)")
-    lines.append(f"  Files scanned: {result.files_scanned}  Hooks found: {result.hooks_found}")
-    lines.append(f"  Findings: {len(result.findings)}")
-    lines.append("")
-
-    if not result.findings:
-        lines.append(c(GREEN, "  ✓ No security issues found"))
-        return "\n".join(lines)
-
-    # Group by severity
-    by_severity: Dict[Severity, List[Finding]] = {}
-    for f in result.findings:
-        by_severity.setdefault(f.severity, []).append(f)
-
-    for sev in Severity:
-        findings = by_severity.get(sev, [])
-        if not findings:
-            continue
-        if sev == Severity.INFO and not verbose:
-            continue
-
-        sev_color = SEVERITY_COLORS[sev]
-        lines.append(c(sev_color, c(BOLD, f"  {sev.value} ({len(findings)})")))
-
+    
+    # Findings
+    if findings:
+        # Group by file
+        by_file: dict[str, list[Finding]] = {}
         for f in findings:
-            loc = f.file
-            if f.line:
-                loc += f":{f.line}"
-            lines.append(f"    [{f.rule_id}] {f.message}")
-            lines.append(f"      {c(GRAY, loc)}")
-            if f.evidence:
-                lines.append(f"      {c(GRAY, '→ ' + f.evidence)}")
+            by_file.setdefault(f.file, []).append(f)
+        
+        for file_path, file_findings in by_file.items():
+            if use_color:
+                lines.append(f"  {BOLD}{file_path}{RESET}")
+            else:
+                lines.append(f"  {file_path}")
+            
+            for f in sorted(file_findings, key=lambda x: Severity.weight(x.severity), reverse=True):
+                sym = SEVERITY_SYMBOLS.get(f.severity, "●")
+                if use_color:
+                    color = SEVERITY_COLORS.get(f.severity, "")
+                    line_info = f":{f.line}" if f.line else ""
+                    lines.append(f"    {color}{sym}{RESET} [{f.rule_id}] {f.message}{line_info}")
+                else:
+                    line_info = f":{f.line}" if f.line else ""
+                    lines.append(f"    {sym} [{f.rule_id}] {f.message}{line_info}")
+                
+                if f.context:
+                    ctx = f.context
+                    if len(ctx) > 80:
+                        ctx = ctx[:77] + "..."
+                    lines.append(f"      → {ctx}")
+                
+                if verbose and f.fix:
+                    if use_color:
+                        lines.append(f"      {BOLD}Fix:{RESET} {f.fix}")
+                    else:
+                        lines.append(f"      Fix: {f.fix}")
+            
             lines.append("")
-
+    else:
+        lines.append("  ✓ No security issues found in git hooks\n")
+    
     return "\n".join(lines)
 
 
-def format_json(result: ScanResult) -> str:
-    """Format scan result as JSON."""
+def format_json(findings: list[Finding], grade: str, score: int) -> str:
+    """Format findings as JSON."""
     data = {
-        "grade": result.grade,
-        "risk": result.risk_label,
-        "score": result.risk_score,
-        "files_scanned": result.files_scanned,
-        "hooks_found": result.hooks_found,
-        "findings": [f.to_dict() for f in result.findings],
+        "tool": "hookaudit",
+        "version": __version__,
+        "grade": grade,
+        "score": score,
+        "total_findings": len(findings),
+        "by_severity": {},
+        "findings": [f.to_dict() for f in findings],
     }
+    
+    for f in findings:
+        data["by_severity"][f.severity] = data["by_severity"].get(f.severity, 0) + 1
+    
     return json.dumps(data, indent=2)
 
 
-# ── Rule Reference ──────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-RULES = {
-    "HA001": ("CRITICAL", "Reverse shell patterns (bash, netcat, python, perl, ruby, socat)"),
-    "HA002": ("CRITICAL", "Credential theft (SSH keys, AWS/GCP creds, keychains, browser data)"),
-    "HA003": ("HIGH", "Data exfiltration (HTTP POST, DNS, netcat pipe, scp/rsync)"),
-    "HA004": ("CRITICAL", "Download and execute (curl|sh, wget|sh, download+chmod+x)"),
-    "HA005": ("HIGH", "Obfuscated code (base64, hex, eval, IFS manipulation)"),
-    "HA006": ("CRITICAL", "Dangerous commands (rm -rf /, fork bomb, disk overwrite)"),
-    "HA007": ("HIGH", "Privilege escalation (sudo, su, setuid/setgid)"),
-    "HA008": ("CRITICAL", "Environment variable exfiltration (env/secrets piped to network)"),
-    "HA009": ("MEDIUM", "Background process spawning (nohup, crontab, at, screen/tmux)"),
-    "HA010": ("HIGH", "Filesystem modification outside repo (shell profiles, /etc, /usr)"),
-    "HA011": ("CRITICAL", "Crypto mining indicators (miners, stratum pools, mining algorithms)"),
-    "HA012": ("HIGH", "Gitattributes filter/diff/merge drivers (arbitrary code execution)"),
-    "HA013": ("HIGH", "Dangerous git config (fsmonitor, hooksPath, credential helper)"),
-    "HA014": ("—", "Husky hook framework scanning"),
-    "HA015": ("MEDIUM", "Pre-commit config suspicious repos or entries"),
-    "HA016": ("—", "Lefthook config scanning"),
-    "HA017": ("INFO", "Hook metadata (auto-triggered hooks, executable permissions)"),
-    "HA018": ("HIGH", "Binary content in hook files"),
-}
+def scan_project(project_dir: Path, ignored: set[str]) -> list[Finding]:
+    """Run all scanners on a project directory."""
+    findings = []
+    
+    # 1. .pre-commit-config.yaml
+    precommit_config = project_dir / ".pre-commit-config.yaml"
+    if precommit_config.is_file():
+        findings.extend(scan_precommit_config(precommit_config, ignored))
+    
+    # Also check alternate name
+    precommit_config_alt = project_dir / ".pre-commit-config.yml"
+    if precommit_config_alt.is_file():
+        findings.extend(scan_precommit_config(precommit_config_alt, ignored))
+    
+    # 2. .git/hooks/
+    git_hooks = project_dir / ".git" / "hooks"
+    if git_hooks.is_dir():
+        findings.extend(scan_git_hooks_dir(git_hooks, ignored))
+    
+    # 3. Husky
+    findings.extend(scan_husky(project_dir, ignored))
+    
+    # 4. Lefthook
+    findings.extend(scan_lefthook(project_dir, ignored))
+    
+    # 5. lint-staged
+    findings.extend(scan_lint_staged(project_dir, ignored))
+    
+    # 6. Overcommit
+    findings.extend(scan_overcommit(project_dir, ignored))
+    
+    # 7. Check for core.hooksPath in git config
+    git_config = project_dir / ".git" / "config"
+    if git_config.is_file():
+        try:
+            text = git_config.read_text(encoding="utf-8", errors="replace")
+            match = re.search(r"hooksPath\s*=\s*(.+)", text)
+            if match:
+                hooks_path = match.group(1).strip()
+                custom_hooks = Path(hooks_path)
+                if not custom_hooks.is_absolute():
+                    custom_hooks = project_dir / hooks_path
+                if custom_hooks.is_dir() and custom_hooks != git_hooks:
+                    findings.extend(scan_git_hooks_dir(custom_hooks, ignored))
+                
+                # Warn about custom hooks path
+                if "HK010" not in ignored:
+                    findings.append(Finding(
+                        rule_id="HK010",
+                        severity=Severity.MEDIUM,
+                        message=f"Custom core.hooksPath configured: {hooks_path}",
+                        file=str(git_config),
+                        fix="Verify the custom hooks path is trusted and version-controlled",
+                    ))
+        except (OSError, PermissionError):
+            pass
+    
+    return findings
 
 
-def format_rules() -> str:
+def list_rules() -> str:
     """List all rules."""
-    lines = ["hookaudit rules:", ""]
-    for rule_id, (severity, desc) in sorted(RULES.items()):
-        lines.append(f"  {rule_id}  [{severity:>8s}]  {desc}")
+    lines = ["\nhookaudit — Rule Reference\n"]
+    for rule_id in sorted(RULES):
+        r = RULES[rule_id]
+        lines.append(f"  {rule_id}  [{r['severity']:8s}]  {r['name']}: {r['description']}")
+    lines.append("")
     return "\n".join(lines)
 
 
-# ── CLI ─────────────────────────────────────────────────────────────
-
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hookaudit",
-        description="Git Hook & Repository Config Security Auditor",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""examples:
-  hookaudit                     Scan current repository
-  hookaudit /path/to/repo       Scan specific repository
-  hookaudit -f hook-script.sh   Scan a single file
-  hookaudit --json              JSON output for CI
-  hookaudit --rules             List all rules
-""",
+        description="Git Hook Security Auditor — scan hook configs for supply chain risks",
     )
-    parser.add_argument("path", nargs="?", default=".",
-                        help="Repository path or file to scan (default: .)")
-    parser.add_argument("-f", "--file", action="store_true",
-                        help="Scan a single file instead of a repository")
-    parser.add_argument("--json", action="store_true",
-                        help="Output as JSON")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Show INFO-level findings")
-    parser.add_argument("--rules", action="store_true",
-                        help="List all rules and exit")
-    parser.add_argument("--ci", action="store_true",
-                        help="CI mode: exit 1 if HIGH+ findings, exit 2 if CRITICAL")
-    parser.add_argument("--version", action="version",
-                        version=f"hookaudit {__version__}")
-
-    args = parser.parse_args()
-
-    if args.rules:
-        print(format_rules())
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Project directory to scan (default: current dir)",
+    )
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--check", nargs="?", const="B", metavar="GRADE",
+                       help="CI mode: exit 1 if below grade (default: B)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show fix suggestions")
+    parser.add_argument("--list-rules", action="store_true", help="List all rules")
+    parser.add_argument("--severity", choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                       help="Minimum severity to report")
+    parser.add_argument("--ignore", help="Comma-separated rule IDs to skip")
+    parser.add_argument("--no-color", action="store_true", help="Disable color output")
+    parser.add_argument("--version", action="version", version=f"hookaudit {__version__}")
+    
+    args = parser.parse_args(argv)
+    
+    if args.list_rules:
+        print(list_rules())
         return 0
-
-    target = Path(args.path).resolve()
-
-    if args.file:
-        result = scan_file(target)
-    else:
-        result = scan_repo(target)
-
+    
+    project_dir = Path(args.path).resolve()
+    if not project_dir.is_dir():
+        print(f"Error: {args.path} is not a directory", file=sys.stderr)
+        return 2
+    
+    ignored = set()
+    if args.ignore:
+        ignored = {r.strip().upper() for r in args.ignore.split(",")}
+    
+    # Scan
+    findings = scan_project(project_dir, ignored)
+    
+    # Filter by severity
+    if args.severity:
+        min_weight = Severity.weight(args.severity)
+        findings = [f for f in findings if Severity.weight(f.severity) >= min_weight]
+    
+    # Sort by severity (critical first), then file, then line
+    findings.sort(key=lambda f: (-Severity.weight(f.severity), f.file, f.line or 0))
+    
+    # Grade
+    grade, score = calculate_grade(findings)
+    
+    # Output
+    use_color = not args.no_color and sys.stdout.isatty() and not args.json
+    
     if args.json:
-        print(format_json(result))
+        print(format_json(findings, grade, score))
     else:
-        print(format_text(result, verbose=args.verbose))
-
-    if args.ci:
-        has_critical = any(f.severity == Severity.CRITICAL for f in result.findings)
-        has_high = any(f.severity == Severity.HIGH for f in result.findings)
-        if has_critical:
-            return 2
-        if has_high:
+        print(format_text(findings, grade, score, verbose=args.verbose, use_color=use_color))
+    
+    # CI mode
+    if args.check:
+        threshold = args.check.upper()
+        grade_order = {"A+": 6, "A": 5, "B": 4, "C": 3, "D": 2, "F": 1}
+        if grade_order.get(grade, 0) < grade_order.get(threshold, 0):
             return 1
+    
     return 0
 
 

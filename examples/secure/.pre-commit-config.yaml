@@ -1,0 +1,41 @@
+# Example: Secure pre-commit config following best practices
+
+repos:
+  # Pinned to SHA (immutable)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300de36965b1ba2f20e89820075a1090d878
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+
+  # Trusted org, SHA-pinned
+  - repo: https://github.com/psf/black
+    rev: 2a1c764fd61273ef4e38b4a8f6e35f98a47a3563
+    hooks:
+      - id: black
+
+  # Trusted org, SHA-pinned
+  - repo: https://github.com/PyCQA/flake8
+    rev: c83d0e8d1c5b39cf21e3cb0d19c7ae6a3ac0c7a9
+    hooks:
+      - id: flake8
+
+  # Trusted org, SHA-pinned
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 75b98813603ec79a2c3ade75921f7a4ced7e1753
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Local hook — safe, just runs a Python linter
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: python
+        types: [python]

